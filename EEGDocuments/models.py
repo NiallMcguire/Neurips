@@ -437,6 +437,13 @@ def compute_multi_vector_similarity(query_vectors, doc_vectors, temperature=1.0)
 
 def compute_single_vector_similarity(query_vectors, doc_vectors, temperature=1.0):
     """Compute cosine similarity for single vectors (cls, max, mean pooling)"""
+
+    # Handle list input (convert to tensors)
+    if isinstance(query_vectors, list):
+        query_vectors = torch.stack([qv for qv in query_vectors])
+    if isinstance(doc_vectors, list):
+        doc_vectors = torch.stack([dv for dv in doc_vectors])
+
     batch_size = query_vectors.size(0)
     similarities = []
 
