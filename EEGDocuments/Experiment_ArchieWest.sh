@@ -27,9 +27,8 @@ python controller.py \
     --lr 1e-4 \
     --patience 10 \
     --epochs 50 \
-    --batch_size 16 \
+    --batch_size 32 \
     --max_eeg_len 50 \
-    --holdout_subjects \
     --seed 42
 
 /opt/software/scripts/job_epilogue.sh
