@@ -6,7 +6,7 @@
 #SBATCH --export=ALL
 #SBATCH --partition=gpu --gpus=1 --mem-per-cpu=36000
 #SBATCH --account=moshfeghi-pmwc
-#SBATCH --time=2:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mail-user=niall.mcguire@strath.ac.uk
 #SBATCH --mail-type=END
 #SBATCH --job-name=eeg_eeg_alignment_nieuwland
