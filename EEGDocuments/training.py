@@ -699,7 +699,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
         # Ranking evaluation every 3rd epoch
         if epoch_num % 3 == 0:
             ranking_metrics = perform_ranking_evaluation(
-                model, val_dataloader, device, epoch_num, subset_size=1000
+                model, val_dataloader, device, epoch_num, subset_size=300
             )
 
         # Log epoch-level metrics
@@ -733,7 +733,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     # Final test evaluation
     print(f"\n=== FINAL TEST EVALUATION ===")
     test_ranking_metrics = perform_ranking_evaluation(
-        model, test_dataloader, device, epoch_num=-1, subset_size=None  # Use all docs for test
+        model, test_dataloader, device, epoch_num=-1, subset_size=300  # Use all docs for test
     )
 
     # Rename test metrics
