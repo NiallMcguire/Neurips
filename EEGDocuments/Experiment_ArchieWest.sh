@@ -20,7 +20,7 @@ module load anaconda/python-3.9.7/2021.11
 python controller.py \
     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     --dataset_type nieuwland \
-    --document_type text \
+    --document_type eeg \
     --pooling_strategy max \
     --eeg_arch transformer \
     --hidden_dim 768 \
