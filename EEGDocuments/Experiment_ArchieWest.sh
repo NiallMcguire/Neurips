@@ -30,6 +30,6 @@ python controller.py \
     --batch_size 32 \
     --max_eeg_len 50 \
     --seed 42 \
-    --subject_mode cross-subject \
+    --subject_mode within-subject \
 
 /opt/software/scripts/job_epilogue.sh
