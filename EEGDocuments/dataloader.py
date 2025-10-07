@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Simplified Dataloader for EEG-EEG vs EEG-Text Alignment
-Focus: Load both query_eeg and doc_eeg, toggle between EEG/Text documents
+Version: 2.0
+Focus: Support within-subject and cross-subject pairing
 """
 
 import numpy as np
@@ -115,10 +116,12 @@ def compute_global_eeg_dimensions(data_path, max_eeg_len=50, dataset_type='auto'
 class SimplifiedEEGDataloader(Dataset):
     """
     Simplified Dataset for EEG-EEG vs EEG-Text alignment experiments
+    Version: 2.0
 
     Key features:
     - Always uses query_eeg as query
     - Toggles between doc_eeg (EEG-EEG) or doc_text (EEG-Text) as document
+    - Supports within-subject and cross-subject pairing
     - No masking complexity
     - Simple train/val/test splits
     """
@@ -128,10 +131,11 @@ class SimplifiedEEGDataloader(Dataset):
                  split: str = 'train', normalize_eeg: bool = True,
                  debug: bool = False, global_eeg_dims: tuple = None,
                  dataset_type: str = 'auto', holdout_subjects: bool = False,
-                 document_type: str = 'text'):
+                 document_type: str = 'text', subject_mode: str = 'within-subject'):
         """
         Args:
             document_type: 'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
+            subject_mode: 'within-subject' (same person) or 'cross-subject' (different people)
         """
 
         self.tokenizer = tokenizer
@@ -141,6 +145,7 @@ class SimplifiedEEGDataloader(Dataset):
         self.debug = debug
         self.holdout_subjects = holdout_subjects
         self.document_type = document_type  # 'text' or 'eeg'
+        self.subject_mode = subject_mode  # 'within-subject' or 'cross-subject'
 
         # Set global EEG dimensions
         if global_eeg_dims is not None:
@@ -168,6 +173,7 @@ class SimplifiedEEGDataloader(Dataset):
         if self.debug:
             print(f"Loaded {len(self.ict_pairs)} ICT pairs")
             print(f"Document type: {document_type} ({'EEG-EEG' if document_type == 'eeg' else 'EEG-Text'} alignment)")
+            print(f"Subject mode: {subject_mode}")
 
         # Validate dataset compatibility
         if document_type == 'eeg':
@@ -176,6 +182,14 @@ class SimplifiedEEGDataloader(Dataset):
                 raise ValueError("Dataset does not support EEG-EEG alignment (missing doc_eeg)")
             if self.debug:
                 print("✅ Dataset supports EEG-EEG alignment")
+
+        # For cross-subject mode, we need multiple subjects
+        if subject_mode == 'cross-subject' and document_type == 'eeg':
+            unique_subjects = set(pair['participant_id'] for pair in self.ict_pairs)
+            if len(unique_subjects) < 2:
+                raise ValueError(f"Cross-subject mode requires at least 2 subjects, found {len(unique_subjects)}")
+            if self.debug:
+                print(f"✅ Dataset has {len(unique_subjects)} subjects for cross-subject pairing")
 
         # Create train/val/test split
         random.seed(42)  # Fixed seed for reproducible splits
@@ -191,6 +205,10 @@ class SimplifiedEEGDataloader(Dataset):
 
         self.pairs = [self.ict_pairs[i] for i in self.indices]
 
+        # For cross-subject mode, build sentence-to-subject mapping
+        if subject_mode == 'cross-subject' and document_type == 'eeg':
+            self._build_sentence_subject_mapping()
+
         # Process pairs once
         self.processed_pairs = []
         self._process_pairs()
@@ -200,6 +218,27 @@ class SimplifiedEEGDataloader(Dataset):
                 f"{split} split: {len(self.processed_pairs)} samples from {len(self.unique_subjects)} unique subjects")
             if len(self.processed_pairs) > 0:
                 self._debug_print_sample(0)
+
+    def _build_sentence_subject_mapping(self):
+        """Build mapping of sentences to subjects for cross-subject pairing"""
+        self.sentence_to_subjects = {}  # sentence_id -> {participant_id: [pair_indices]}
+
+        for idx, pair in enumerate(self.pairs):
+            sentence_id = pair.get('sentence_id', 0)
+            participant_id = pair.get('participant_id', 'unknown')
+
+            if sentence_id not in self.sentence_to_subjects:
+                self.sentence_to_subjects[sentence_id] = {}
+
+            if participant_id not in self.sentence_to_subjects[sentence_id]:
+                self.sentence_to_subjects[sentence_id][participant_id] = []
+
+            self.sentence_to_subjects[sentence_id][participant_id].append(idx)
+
+        if self.debug:
+            print(f"Built sentence-subject mapping: {len(self.sentence_to_subjects)} unique sentences")
+            multi_subject_sentences = sum(1 for s in self.sentence_to_subjects.values() if len(s) > 1)
+            print(f"  Sentences with multiple subjects: {multi_subject_sentences}")
 
     def _create_subject_split(self, split, train_ratio, debug):
         """Create subject-based train/val/test split"""
@@ -307,27 +346,65 @@ class SimplifiedEEGDataloader(Dataset):
         if query_eeg_processed is None:
             return None
 
-        # Extract document based on document_type
+        # Extract document based on document_type and subject_mode
         if self.document_type == 'eeg':
-            # EEG-EEG alignment: use doc_eeg
-            doc_eeg = pair.get('doc_eeg', None)
-            if doc_eeg is None:
-                return None
+            # EEG-EEG alignment
+            if self.subject_mode == 'within-subject':
+                # Within-subject: use doc_eeg from same participant
+                doc_eeg = pair.get('doc_eeg', None)
+                if doc_eeg is None:
+                    return None
 
-            doc_eeg_processed = self._process_eeg(doc_eeg)
-            if doc_eeg_processed is None:
-                return None
+                doc_eeg_processed = self._process_eeg(doc_eeg)
+                if doc_eeg_processed is None:
+                    return None
 
-            doc_data = doc_eeg_processed
+                doc_data = doc_eeg_processed
+                doc_participant_id = pair.get('participant_id', 'unknown')
+
+            else:  # cross-subject
+                # Cross-subject: find doc_eeg from different participant, same sentence
+                sentence_id = pair.get('sentence_id', 0)
+                query_participant_id = pair.get('participant_id', 'unknown')
+
+                # Find other participants who read the same sentence
+                if sentence_id in self.sentence_to_subjects:
+                    other_participants = [p for p in self.sentence_to_subjects[sentence_id].keys()
+                                          if p != query_participant_id]
+
+                    if other_participants:
+                        # Randomly select a different participant
+                        doc_participant_id = random.choice(other_participants)
+                        doc_pair_indices = self.sentence_to_subjects[sentence_id][doc_participant_id]
+                        doc_pair_idx = random.choice(doc_pair_indices)
+                        doc_pair = self.pairs[doc_pair_idx]
+
+                        doc_eeg = doc_pair.get('doc_eeg', None)
+                        if doc_eeg is None:
+                            return None
+
+                        doc_eeg_processed = self._process_eeg(doc_eeg)
+                        if doc_eeg_processed is None:
+                            return None
+
+                        doc_data = doc_eeg_processed
+                    else:
+                        # No other participants for this sentence, skip
+                        return None
+                else:
+                    # Sentence not in mapping, skip
+                    return None
+
             doc_text = None
 
         else:  # document_type == 'text'
-            # EEG-Text alignment: use doc_text
+            # EEG-Text alignment: use doc_text (subject_mode doesn't apply)
             doc_text = pair.get('doc_text', '').strip()
             if not doc_text:
                 return None
 
             doc_data = None
+            doc_participant_id = pair.get('participant_id', 'unknown')
 
         # Extract query text for reference
         query_text = pair.get('query_text', '').strip()
@@ -337,9 +414,11 @@ class SimplifiedEEGDataloader(Dataset):
             'query_eeg': query_eeg_processed,
             'doc_text': doc_text,
             'doc_eeg': doc_data,
-            'participant_id': pair.get('participant_id', 'unknown'),
+            'query_participant_id': pair.get('participant_id', 'unknown'),
+            'doc_participant_id': doc_participant_id,
             'sentence_id': pair.get('sentence_id', 0),
             'document_type': self.document_type,
+            'subject_mode': self.subject_mode,
             'original_idx': idx
         }
 
@@ -424,12 +503,19 @@ class SimplifiedEEGDataloader(Dataset):
         print(f"\nSample {idx}:")
         print(f"  Query text: '{sample['query_text'][:100]}...'")
         print(f"  Query EEG shape: {sample['query_eeg'].shape}")
+        print(f"  Query participant: {sample['query_participant_id']}")
         print(f"  Document type: {sample['document_type']}")
+        print(f"  Subject mode: {sample['subject_mode']}")
         if sample['document_type'] == 'text':
             print(f"  Doc text: '{sample['doc_text'][:100]}...'")
+            print(f"  Doc participant: {sample['doc_participant_id']}")
         else:
             print(f"  Doc EEG shape: {sample['doc_eeg'].shape}")
-        print(f"  Participant: {sample['participant_id']}")
+            print(f"  Doc participant: {sample['doc_participant_id']}")
+            if sample['subject_mode'] == 'cross-subject':
+                print(f"  ✅ Cross-subject pairing: {sample['query_participant_id']} → {sample['doc_participant_id']}")
+            else:
+                print(f"  Within-subject pairing: {sample['query_participant_id']} → {sample['doc_participant_id']}")
 
     def __len__(self):
         return len(self.processed_pairs)
@@ -453,9 +539,11 @@ class SimplifiedEEGDataloader(Dataset):
                 'doc_eeg': doc_eeg_tensor,
                 'doc_text_tokens': None,  # Not used
                 'metadata': {
-                    'participant_id': sample['participant_id'],
+                    'query_participant_id': sample['query_participant_id'],
+                    'doc_participant_id': sample['doc_participant_id'],
                     'sentence_id': sample['sentence_id'],
                     'document_type': sample['document_type'],
+                    'subject_mode': sample['subject_mode'],
                     'query_text': sample['query_text'],
                     'original_idx': sample['original_idx']
                 }
@@ -470,9 +558,11 @@ class SimplifiedEEGDataloader(Dataset):
                 'doc_eeg': None,  # Not used
                 'doc_text_tokens': doc_tokens,
                 'metadata': {
-                    'participant_id': sample['participant_id'],
+                    'query_participant_id': sample['query_participant_id'],
+                    'doc_participant_id': sample['doc_participant_id'],
                     'sentence_id': sample['sentence_id'],
                     'document_type': sample['document_type'],
+                    'subject_mode': sample['subject_mode'],
                     'query_text': sample['query_text'],
                     'doc_text': sample['doc_text'],
                     'original_idx': sample['original_idx']
@@ -517,21 +607,29 @@ def debug_batch(batch, print_details=True):
     """Debug utility to inspect a batch"""
     batch_size = len(batch['metadata'])
     document_type = batch['document_type']
+    subject_mode = batch['metadata'][0]['subject_mode']
 
     print(f"\nBatch Debug:")
     print(f"  Batch size: {batch_size}")
     print(f"  Document type: {document_type} ({'EEG-EEG' if document_type == 'eeg' else 'EEG-Text'} alignment)")
+    print(f"  Subject mode: {subject_mode}")
     print(f"  Query EEGs: {batch['query_eegs'].shape}")
 
     if document_type == 'eeg':
         print(f"  Doc EEGs: {batch['doc_eegs'].shape}")
+        if subject_mode == 'cross-subject':
+            query_subjects = [m['query_participant_id'] for m in batch['metadata']]
+            doc_subjects = [m['doc_participant_id'] for m in batch['metadata']]
+            cross_pairs = sum(1 for q, d in zip(query_subjects, doc_subjects) if q != d)
+            print(f"  Cross-subject pairs: {cross_pairs}/{batch_size}")
     else:
         print(f"  Doc text input_ids: {batch['doc_text_tokens']['input_ids'].shape}")
         print(f"  Doc text attention_mask: {batch['doc_text_tokens']['attention_mask'].shape}")
 
     if print_details and batch_size > 0:
         meta = batch['metadata'][0]
-        print(f"  Sample participant: {meta['participant_id']}")
+        print(f"  Sample query participant: {meta['query_participant_id']}")
+        print(f"  Sample doc participant: {meta['doc_participant_id']}")
         print(f"  Sample query: '{meta['query_text'][:50]}...'")
         if document_type == 'text':
             print(f"  Sample doc: '{meta['doc_text'][:50]}...'")

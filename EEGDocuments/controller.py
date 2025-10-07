@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Simplified Controller for EEG-EEG vs EEG-Text Alignment Experiments
-Focus: Compare EEG query alignment to EEG documents vs Text documents
+Version: 2.0
+Focus: Compare within-subject vs cross-subject alignment
 """
 
 import torch
@@ -39,18 +40,35 @@ def create_output_directory(base_name="eeg_alignment"):
     return output_dir
 
 
+def detect_dataset_name(data_path):
+    """Detect dataset name from file path"""
+    data_path_str = str(data_path).lower()
+
+    if 'nieuwland' in data_path_str:
+        return 'Nieuwland'
+    elif 'zuco' in data_path_str:
+        return 'ZuCo'
+    elif 'k408' in data_path_str or 'k-408' in data_path_str:
+        return 'K408'
+    else:
+        return 'Unknown'
+
+
 def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_len=256,
                                   max_eeg_len=50, train_ratio=0.8, debug=False,
                                   dataset_type='auto', holdout_subjects=False,
-                                  document_type='text', global_eeg_dims=None):
+                                  document_type='text', global_eeg_dims=None,
+                                  subject_mode='within-subject'):
     """
     Create simplified dataloaders for EEG alignment experiments
 
     Args:
         document_type: 'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
+        subject_mode: 'within-subject' or 'cross-subject'
     """
     print(f"Loading data from: {data_path}")
     print(f"Document type: {document_type.upper()}")
+    print(f"Subject mode: {subject_mode}")
     print(f"Split strategy: {'holdout subjects' if holdout_subjects else 'random sample'}")
 
     # Compute global EEG dimensions if not provided
@@ -64,7 +82,7 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
         max_eeg_len=max_eeg_len, split='train', train_ratio=train_ratio,
         debug=debug, global_eeg_dims=global_eeg_dims,
         dataset_type=dataset_type, holdout_subjects=holdout_subjects,
-        document_type=document_type
+        document_type=document_type, subject_mode=subject_mode
     )
 
     val_dataset = SimplifiedEEGDataloader(
@@ -72,7 +90,7 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
         max_eeg_len=max_eeg_len, split='val', train_ratio=train_ratio,
         debug=debug, global_eeg_dims=global_eeg_dims,
         dataset_type=dataset_type, holdout_subjects=holdout_subjects,
-        document_type=document_type
+        document_type=document_type, subject_mode=subject_mode
     )
 
     test_dataset = SimplifiedEEGDataloader(
@@ -80,7 +98,7 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
         max_eeg_len=max_eeg_len, split='test', train_ratio=train_ratio,
         debug=debug, global_eeg_dims=global_eeg_dims,
         dataset_type=dataset_type, holdout_subjects=holdout_subjects,
-        document_type=document_type
+        document_type=document_type, subject_mode=subject_mode
     )
 
     # Create dataloaders
@@ -114,6 +132,10 @@ def inspect_dataset(data_path, dataset_type='auto'):
         # Detect format
         detected_format = detect_dataset_format(data_path) if dataset_type == 'auto' else dataset_type
         print(f"Dataset format: {detected_format}")
+
+        # Detect dataset name
+        dataset_name = detect_dataset_name(data_path)
+        print(f"Dataset name: {dataset_name}")
 
         # Load dataset
         dataset = np.load(data_path, allow_pickle=True).item()
@@ -169,7 +191,7 @@ def save_experiment_config(config, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Simplified EEG Alignment: Compare EEG-EEG vs EEG-Text alignment')
+        description='Simplified EEG Alignment: Compare within-subject vs cross-subject alignment')
 
     # Data arguments
     parser.add_argument('--data_path', required=True, help='Path to ICT pairs .npy file')
@@ -180,6 +202,9 @@ def main():
     # Core experiment arguments
     parser.add_argument('--document_type', default='text', choices=['text', 'eeg'],
                         help='Document representation: text (EEG-Text) or eeg (EEG-EEG)')
+    parser.add_argument('--subject_mode', default='within-subject',
+                        choices=['within-subject', 'cross-subject'],
+                        help='Subject matching mode: within-subject (same person) or cross-subject (different people)')
     parser.add_argument('--pooling_strategy', default='multi', choices=['multi', 'cls', 'max', 'mean'],
                         help='Pooling strategy for representations')
 
@@ -213,6 +238,12 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Detect dataset name
+    dataset_name = detect_dataset_name(args.data_path)
+    print(f"\n=== DATASET INFO ===")
+    print(f"Dataset: {dataset_name}")
+    print(f"Path: {args.data_path}")
+
     # Inspect dataset
     if args.inspect_only:
         inspect_dataset(args.data_path, args.dataset_type)
@@ -243,7 +274,7 @@ def main():
         max_text_len=args.max_text_len, max_eeg_len=args.max_eeg_len,
         train_ratio=args.train_ratio, debug=args.debug,
         dataset_type=args.dataset_type, holdout_subjects=args.holdout_subjects,
-        document_type=args.document_type
+        document_type=args.document_type, subject_mode=args.subject_mode
     )
 
     train_subjects = len(train_dataloader.dataset.unique_subjects)
@@ -252,11 +283,20 @@ def main():
 
     # Create experiment configuration
     config = {
+        'version': 'v1',
         'experiment_type': f'eeg_{args.document_type}_alignment',
         'timestamp': datetime.now().isoformat(),
-        'data_path': str(args.data_path),
+
+        # Dataset info
+        'dataset_name': dataset_name,
+        'dataset_path': str(args.data_path),
+        'dataset_type': args.dataset_type,
+
+        # Experiment config
         'document_type': args.document_type,
+        'subject_mode': args.subject_mode,
         'alignment_task': f'EEG-{args.document_type.upper()}',
+        'alignment_method': args.subject_mode,
 
         # Model config
         'colbert_model_name': args.colbert_model_name,
@@ -292,7 +332,9 @@ def main():
     }
 
     print(f"\n=== EXPERIMENT SETUP ===")
+    print(f"Dataset: {dataset_name}")
     print(f"Alignment Task: EEG → {args.document_type.upper()}")
+    print(f"Subject Mode: {args.subject_mode}")
     print(f"Pooling Strategy: {args.pooling_strategy}")
     print(f"EEG Architecture: {args.eeg_arch}")
     print(f"Training samples: {config['train_samples']} ({train_subjects} subjects)")
@@ -333,6 +375,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     print(f"\n=== TRAINING START ===")
     print(f"Task: EEG queries → {args.document_type.upper()} documents")
+    print(f"Method: {args.subject_mode}")
 
     trained_model = train_simplified_model(
         model=model,
@@ -348,7 +391,7 @@ def main():
     )
 
     # Save trained model
-    model_save_path = output_dir / f"simplified_model_{args.document_type}_{args.pooling_strategy}_{args.eeg_arch}.pt"
+    model_save_path = output_dir / f"simplified_model_{args.document_type}_{args.subject_mode}_{args.pooling_strategy}_{args.eeg_arch}.pt"
     torch.save({
         'model_state_dict': trained_model.state_dict(),
         'config': config,
@@ -358,7 +401,9 @@ def main():
 
     finish_wandb()
     print(f"\n=== EXPERIMENT COMPLETE ===")
+    print(f"Dataset: {dataset_name}")
     print(f"Alignment Task: EEG → {args.document_type.upper()}")
+    print(f"Subject Mode: {args.subject_mode}")
     print(f"Results saved in: {output_dir}")
 
 

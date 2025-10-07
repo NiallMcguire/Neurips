@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Training for EEG-EEG vs EEG-Text Alignment Experiments
-Clean contrastive learning with ranking evaluation
+Version: 2.0
+Focus: Track dataset name, subject mode, and model version
 """
 
 import torch
@@ -107,7 +108,8 @@ def train_step(model, batch, optimizer, device, step_num, debug=False):
     document_type = batch['document_type']
 
     if debug:
-        print(f"[DEBUG] Training step {step_num} (EEG-{document_type.upper()} alignment)")
+        subject_mode = batch['metadata'][0]['subject_mode']
+        print(f"[DEBUG] Training step {step_num} (EEG-{document_type.upper()} alignment, {subject_mode})")
         print(f"  Query EEGs: {batch['query_eegs'].shape}")
         if document_type == 'eeg':
             print(f"  Doc EEGs: {batch['doc_eegs'].shape}")
@@ -169,7 +171,8 @@ def train_step(model, batch, optimizer, device, step_num, debug=False):
         print(f"  Grad norm: {grad_norm.item():.4f}")
         meta = batch['metadata'][0]
         print(f"  Sample query: '{meta['query_text'][:50]}...'")
-        print(f"  Participant: {meta['participant_id']}")
+        print(f"  Query participant: {meta['query_participant_id']}")
+        print(f"  Doc participant: {meta['doc_participant_id']}")
 
     return loss.item(), metrics, grad_norm.item()
 
@@ -235,7 +238,7 @@ def build_document_database(dataloader):
                 }
             else:  # eeg
                 # Use participant and sentence ID as key for EEG docs
-                doc_key = f"{metadata['participant_id']}_{metadata['sentence_id']}"
+                doc_key = f"{metadata['doc_participant_id']}_{metadata['sentence_id']}"
                 doc_data = {
                     'eeg': batch['doc_eegs'][sample_idx].clone()
                 }
@@ -568,30 +571,50 @@ def validate_epoch(model, val_dataloader, device, epoch_num):
 
 
 def initialize_wandb(config):
-    """Initialize wandb logging"""
+    """Initialize wandb logging with dataset name and subject mode"""
 
+    # Extract config values
+    dataset_name = config.get('dataset_name', 'Unknown')
     document_type = config.get('document_type', 'text')
+    subject_mode = config.get('subject_mode', 'within-subject')
     holdout_subjects = config.get('holdout_subjects', False)
     eeg_arch = config.get('eeg_arch', 'simple')
     pooling_strategy = config.get('pooling_strategy', 'multi')
+    version = config.get('version', 'v1')
 
     # Create descriptive run name
     alignment_type = f"eeg_{document_type}"
+    subject_mode_short = subject_mode.replace('-', '_')
     split_suffix = "_holdout" if holdout_subjects else "_random"
 
-    run_name = f"{alignment_type}_{pooling_strategy}_{eeg_arch}{split_suffix}"
+    run_name = f"{dataset_name}_{alignment_type}_{subject_mode_short}_{pooling_strategy}_{eeg_arch}{split_suffix}"
 
     # Tags
-    tags = ['eeg-alignment', f'eeg-{document_type}', f'arch-{eeg_arch}',
-            f'pooling-{pooling_strategy}',
-            'holdout-subjects' if holdout_subjects else 'random-split']
+    tags = [
+        'eeg-alignment',
+        f'eeg-{document_type}',
+        f'{subject_mode}',
+        f'arch-{eeg_arch}',
+        f'pooling-{pooling_strategy}',
+        f'dataset-{dataset_name}',
+        f'version-{version}',
+        'holdout-subjects' if holdout_subjects else 'random-split'
+    ]
 
     wandb.init(
         project="EEG-Alignment",
         name=run_name,
         config={
+            # Version and dataset info
+            'version': version,
+            'dataset_name': dataset_name,
+            'dataset_path': config.get('dataset_path', 'unknown'),
+
+            # Experiment config
             'alignment_type': f'EEG-{document_type.upper()}',
             'document_type': document_type,
+            'subject_mode': subject_mode,
+            'alignment_method': subject_mode,
             'pooling_strategy': pooling_strategy,
             'holdout_subjects': holdout_subjects,
             'split_method': 'holdout_subjects' if holdout_subjects else 'random_samples',
@@ -641,8 +664,12 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
 
     document_type = model.document_type
     pooling_strategy = model.pooling_strategy
+    subject_mode = config.get('subject_mode', 'within-subject') if config else 'within-subject'
+    dataset_name = config.get('dataset_name', 'Unknown') if config else 'Unknown'
 
     print(f"Starting EEG-{document_type.upper()} alignment training...")
+    print(f"Dataset: {dataset_name}")
+    print(f"Subject mode: {subject_mode}")
     print(f"Pooling strategy: {pooling_strategy}")
     print(f"Early stopping patience: {patience}")
 
@@ -755,6 +782,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     })
 
     print(f"\nEEG-{document_type.upper()} alignment training completed!")
+    print(f"Dataset: {dataset_name}")
+    print(f"Subject mode: {subject_mode}")
     if early_stopped:
         print(f"Stopped early after {epoch_num} epochs")
     print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
