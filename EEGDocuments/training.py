@@ -280,6 +280,7 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
     loss.backward()
 
     # 🔍 DEBUG: Gradient analysis BEFORE clipping
+    # 🔍 DEBUG: Gradient analysis BEFORE clipping
     if debug_this_step:
         print(f"\n🔬 GRADIENT ANALYSIS (before clipping):")
         total_norm = 0.0
@@ -309,7 +310,13 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         print(f"  Total gradient norm (unclipped): {total_norm:.4f}")
         print(f"  Max gradient value: {max_grad:.6f}")
         print(f"  Min gradient value: {min_grad:.6f}")
-        print(f"  Gradient range (max/min): {(max_grad / min_grad if min_grad > 0 else float('inf')):.2e}")
+
+        # FIX: Handle min_grad = 0 case
+        if min_grad > 0:
+            grad_range = max_grad / min_grad
+            print(f"  Gradient range (max/min): {grad_range:.2e}")
+        else:
+            print(f"  Gradient range (max/min): inf (some gradients are zero)")
 
         print(f"\n  Key layer gradients:")
         for name, info in list(grad_info.items())[:5]:  # Show first 5
@@ -320,9 +327,8 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
             print(f"  ⚠️  WARNING: Large gradients detected (norm={total_norm:.2f})")
         if max_grad > 1.0:
             print(f"  ⚠️  WARNING: Gradient values > 1.0 (max={max_grad:.4f})")
-        if (max_grad / min_grad) > 1e6:
+        if min_grad > 0 and (max_grad / min_grad) > 1e6:  # FIX: Check min_grad > 0 first
             print(f"  ⚠️  WARNING: Huge gradient range (may cause instability)")
-
     # Clip gradients
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
