@@ -562,13 +562,17 @@ class SimplifiedEEGDataloader(Dataset):
         else:
             # Fallback to global normalization if subject stats not available
             if len(eeg_tensor.shape) == 3:
-                # Create mask for non-zero values
-                non_zero_mask = (eeg_tensor.abs().sum(dim=(1, 2)) > 0).unsqueeze(1).unsqueeze(2)
+                # Get all non-zero values (simpler approach - no complex masking)
+                non_zero_values = eeg_tensor[eeg_tensor != 0]
 
-                if non_zero_mask.sum() > 0:
-                    mean = torch.mean(eeg_tensor[non_zero_mask])
-                    std = torch.std(eeg_tensor[non_zero_mask])
-                    std = torch.where(std == 0, torch.tensor(1e-6), std)
+                if non_zero_values.numel() > 0:
+                    mean = torch.mean(non_zero_values)
+                    std = torch.std(non_zero_values)
+
+                    # Avoid division by zero
+                    if std < 1e-6:
+                        std = torch.tensor(1.0, device=eeg_tensor.device)
+
                     return (eeg_tensor - mean) / std
 
             return eeg_tensor
