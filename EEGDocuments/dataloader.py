@@ -235,18 +235,18 @@ class SimplifiedEEGDataloader(Dataset):
         for pair in self.pairs:
             participant_id = pair.get('participant_id', 'unknown')
 
-            # Collect query EEG
+            # Collect query EEG - DON'T convert to numpy yet!
             query_eeg = pair.get('query_eeg', None)
             if query_eeg is not None:
                 if participant_id not in subject_eegs:
                     subject_eegs[participant_id] = []
-                subject_eegs[participant_id].append(np.array(query_eeg, dtype=np.float32))
+                subject_eegs[participant_id].append(query_eeg)  # FIX: Removed np.array conversion
 
             # Collect doc EEG if available (for EEG-EEG alignment)
             if self.document_type == 'eeg':
                 doc_eeg = pair.get('doc_eeg', None)
                 if doc_eeg is not None:
-                    subject_eegs[participant_id].append(np.array(doc_eeg, dtype=np.float32))
+                    subject_eegs[participant_id].append(doc_eeg)  # FIX: Removed np.array conversion
 
         # Compute statistics per subject
         subject_stats = {}
@@ -256,10 +256,10 @@ class SimplifiedEEGDataloader(Dataset):
 
             # Concatenate all EEG data for this subject
             try:
-                # Flatten all dimensions except the last (channels)
+                # Flatten all dimensions - now we convert to numpy
                 all_values = []
                 for eeg in eeg_list:
-                    eeg_array = np.array(eeg, dtype=np.float32)
+                    eeg_array = np.array(eeg, dtype=np.float32)  # Convert HERE instead
                     if len(eeg_array.shape) >= 2:
                         # Flatten to get all channel values
                         all_values.append(eeg_array.reshape(-1))
