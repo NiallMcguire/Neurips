@@ -214,13 +214,14 @@ def validation_step(model, batch, device):
 # RANKING EVALUATION
 # ==========================================
 
-def build_document_database(dataloader):
+def build_document_database(dataloader, multi_positive_eval=False):
     """Build unique document database for ranking evaluation"""
 
     print("Building document database for ranking evaluation...")
 
     unique_docs = {}  # text/eeg_id -> doc_info
-    query_to_doc_mapping = {}  # query_idx -> unique_doc_idx
+    query_to_doc_mapping = {}  # query_idx -> unique_doc_idx (or list for multi-positive)
+    sentence_to_doc_indices = {}  # sentence_id -> [doc_indices] for multi-positive
     query_idx = 0
 
     for batch in dataloader:
@@ -229,6 +230,7 @@ def build_document_database(dataloader):
 
         for sample_idx in range(batch_size):
             metadata = batch['metadata'][sample_idx]
+            sentence_id = metadata.get('sentence_id', -1)
 
             if document_type == 'text':
                 doc_key = metadata['doc_text'].strip()
@@ -249,12 +251,25 @@ def build_document_database(dataloader):
                     'idx': unique_doc_idx,
                     'key': doc_key,
                     'type': document_type,
-                    'data': doc_data
+                    'data': doc_data,
+                    'sentence_id': sentence_id,
+                    'participant_id': metadata.get('doc_participant_id', 'unknown')
                 }
+
+                # Track sentence to document mapping for multi-positive
+                if sentence_id not in sentence_to_doc_indices:
+                    sentence_to_doc_indices[sentence_id] = []
+                sentence_to_doc_indices[sentence_id].append(unique_doc_idx)
             else:
                 unique_doc_idx = unique_docs[doc_key]['idx']
 
-            query_to_doc_mapping[query_idx] = unique_doc_idx
+            # For multi-positive: map query to all docs with same sentence_id
+            if multi_positive_eval and document_type == 'eeg':
+                # Will be populated later after all docs are collected
+                query_to_doc_mapping[query_idx] = {'sentence_id': sentence_id, 'primary_doc_idx': unique_doc_idx}
+            else:
+                query_to_doc_mapping[query_idx] = unique_doc_idx
+
             query_idx += 1
 
     # Convert to list for easier batch processing
@@ -262,11 +277,29 @@ def build_document_database(dataloader):
     for doc_key, doc_info in unique_docs.items():
         doc_list[doc_info['idx']] = doc_info
 
+    # For multi-positive: expand query_to_doc_mapping to include all relevant docs
+    if multi_positive_eval:
+        expanded_mapping = {}
+        for q_idx, mapping_info in query_to_doc_mapping.items():
+            if isinstance(mapping_info, dict):  # multi-positive case
+                sentence_id = mapping_info['sentence_id']
+                # Get all doc indices for this sentence
+                relevant_doc_indices = sentence_to_doc_indices.get(sentence_id, [mapping_info['primary_doc_idx']])
+                expanded_mapping[q_idx] = relevant_doc_indices
+            else:  # single positive case (shouldn't happen but handle it)
+                expanded_mapping[q_idx] = [mapping_info]
+        query_to_doc_mapping = expanded_mapping
+
+        print(f"Multi-positive evaluation enabled:")
+        print(f"  Found {len(sentence_to_doc_indices)} unique sentences")
+        avg_docs_per_sentence = np.mean([len(docs) for docs in sentence_to_doc_indices.values()])
+        print(f"  Average documents per sentence: {avg_docs_per_sentence:.2f}")
+
     print(f"Found {len(doc_list)} unique documents for {len(query_to_doc_mapping)} queries")
-    return doc_list, query_to_doc_mapping
+    return doc_list, query_to_doc_mapping, sentence_to_doc_indices if multi_positive_eval else {}
 
 
-def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100, seed=42):
+def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100, seed=42, multi_positive_eval=False):
     """Generate consistent document subsets for fair ranking evaluation"""
 
     print(f"Generating consistent document subsets (subset_size={subset_size}, seed={seed})...")
@@ -276,15 +309,22 @@ def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100,
 
     query_subsets = {}  # query_idx -> list of doc_indices
 
-    for query_idx, correct_doc_idx in query_to_doc_mapping.items():
-        # Always include correct document
-        doc_subset_indices = [correct_doc_idx]
+    for query_idx, correct_doc_info in query_to_doc_mapping.items():
+        # Handle multi-positive (list) vs single positive (int)
+        if multi_positive_eval and isinstance(correct_doc_info, list):
+            correct_doc_indices = correct_doc_info
+        else:
+            correct_doc_indices = [correct_doc_info] if isinstance(correct_doc_info, int) else correct_doc_info
 
-        # Sample random negatives
-        negative_candidates = [i for i in range(len(doc_list)) if i != correct_doc_idx]
+        # Always include all correct documents
+        doc_subset_indices = correct_doc_indices.copy()
+
+        # Sample random negatives (excluding all correct docs)
+        negative_candidates = [i for i in range(len(doc_list)) if i not in correct_doc_indices]
         if negative_candidates:
+            num_negatives_needed = max(0, subset_size - len(correct_doc_indices))
             random_negatives = random.sample(negative_candidates,
-                                             min(subset_size - 1, len(negative_candidates)))
+                                             min(num_negatives_needed, len(negative_candidates)))
             doc_subset_indices.extend(random_negatives)
 
         query_subsets[query_idx] = doc_subset_indices
@@ -371,28 +411,53 @@ def rank_documents_for_query(model, query_eeg, doc_list, doc_indices, device):
     return ranked_indices, ranked_scores
 
 
-def compute_ranking_metrics(ranked_doc_indices, correct_doc_idx, k_values=[1, 5, 10, 20]):
-    """Compute ranking metrics for a single query"""
+def compute_ranking_metrics(ranked_doc_indices, correct_doc_indices, k_values=[1, 5, 10, 20]):
+    """
+    Compute ranking metrics for a single query
+
+    Args:
+        ranked_doc_indices: List of doc indices in ranked order
+        correct_doc_indices: List of all correct doc indices (can be single or multiple)
+    """
 
     metrics = {}
 
-    # Find rank of correct document (1-indexed)
-    try:
-        correct_rank = ranked_doc_indices.index(correct_doc_idx) + 1
-    except ValueError:
-        correct_rank = len(ranked_doc_indices) + 1  # Not found
+    # Ensure correct_doc_indices is a list
+    if isinstance(correct_doc_indices, int):
+        correct_doc_indices = [correct_doc_indices]
 
-    # Mean Reciprocal Rank
-    metrics['rr'] = 1.0 / correct_rank if correct_rank <= len(ranked_doc_indices) else 0.0
-    metrics['rank_of_correct'] = correct_rank
+    num_relevant = len(correct_doc_indices)
+
+    # Find rank of first correct document (1-indexed)
+    first_correct_rank = float('inf')
+    for correct_idx in correct_doc_indices:
+        try:
+            rank = ranked_doc_indices.index(correct_idx) + 1
+            first_correct_rank = min(first_correct_rank, rank)
+        except ValueError:
+            continue
+
+    if first_correct_rank == float('inf'):
+        first_correct_rank = len(ranked_doc_indices) + 1
+
+    # Mean Reciprocal Rank (based on first correct doc)
+    metrics['rr'] = 1.0 / first_correct_rank if first_correct_rank <= len(ranked_doc_indices) else 0.0
+    metrics['rank_of_correct'] = first_correct_rank
 
     # Hit@K, Precision@K, and Recall@K for all K values
     for k in k_values:
         if k <= len(ranked_doc_indices):
-            hit_at_k = 1.0 if correct_rank <= k else 0.0
+            # Count how many relevant docs are in top-k
+            top_k = ranked_doc_indices[:k]
+            num_relevant_in_top_k = sum(1 for doc_idx in top_k if doc_idx in correct_doc_indices)
+
+            hit_at_k = 1.0 if num_relevant_in_top_k > 0 else 0.0
+            precision_at_k = num_relevant_in_top_k / k
+            recall_at_k = num_relevant_in_top_k / num_relevant if num_relevant > 0 else 0.0
+
             metrics[f'hit_at_{k}'] = hit_at_k
-            metrics[f'precision_at_{k}'] = hit_at_k / k
-            metrics[f'recall_at_{k}'] = hit_at_k  # Single relevant doc
+            metrics[f'precision_at_{k}'] = precision_at_k
+            metrics[f'recall_at_{k}'] = recall_at_k
         else:
             metrics[f'hit_at_{k}'] = 0.0
             metrics[f'precision_at_{k}'] = 0.0
@@ -401,12 +466,13 @@ def compute_ranking_metrics(ranked_doc_indices, correct_doc_idx, k_values=[1, 5,
     return metrics
 
 
-def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size=100):
+def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size=100, multi_positive_eval=False):
     """Perform ranking evaluation"""
 
     print(f"\n=== RANKING EVALUATION (Epoch {epoch_num}) ===")
+    print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
 
-    doc_list, query_to_doc_mapping = build_document_database(dataloader)
+    doc_list, query_to_doc_mapping, sentence_to_doc_indices = build_document_database(dataloader, multi_positive_eval)
 
     if len(doc_list) == 0 or len(query_to_doc_mapping) == 0:
         print("Warning: No valid query-document pairs found for ranking evaluation")
@@ -417,7 +483,7 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         print(f"Warning: Only {len(doc_list)} documents available, using all")
         subset_size = len(doc_list)
 
-    query_subsets = generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size)
+    query_subsets = generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size, multi_positive_eval=multi_positive_eval)
     queries = collect_queries(dataloader, device)
 
     print(f"Ranking evaluation: {len(queries)} queries against {subset_size} documents each")
@@ -429,14 +495,14 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         if query_idx not in query_to_doc_mapping:
             continue
 
-        correct_doc_idx = query_to_doc_mapping[query_idx]
+        correct_doc_info = query_to_doc_mapping[query_idx]
         doc_subset_indices = query_subsets[query_idx]
 
         ranked_indices, scores = rank_documents_for_query(
             model, query_eeg, doc_list, doc_subset_indices, device
         )
 
-        query_metrics = compute_ranking_metrics(ranked_indices, correct_doc_idx)
+        query_metrics = compute_ranking_metrics(ranked_indices, correct_doc_info)
         all_metrics.append(query_metrics)
 
         if (query_idx + 1) % 50 == 0:
@@ -462,11 +528,14 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         'ranking/num_queries_evaluated': len(all_metrics),
         'ranking/epoch_num': epoch_num,
         'ranking/subset_size': subset_size,
-        'ranking/document_type': model.document_type
+        'ranking/document_type': model.document_type,
+        'ranking/multi_positive_eval': multi_positive_eval
     })
 
     # Print summary
     print(f"Ranking Results (EEG-{model.document_type.upper()}):")
+    if multi_positive_eval:
+        print(f"  [Multi-Positive Mode] All recordings of same sentence treated as relevant")
     print(f"  Queries Evaluated: {len(all_metrics)}")
     print(f"  MRR: {ranking_metrics['ranking/rr']:.4f}")
     print(f"  Hit@1: {ranking_metrics['ranking/hit_at_1']:.4f}")
@@ -619,6 +688,7 @@ def initialize_wandb(config):
             'holdout_subjects': holdout_subjects,
             'split_method': 'holdout_subjects' if holdout_subjects else 'random_samples',
 
+            'multi_positive_eval': config.get('multi_positive_eval', False),
             # Model config
             'colbert_model_name': config.get('colbert_model_name', 'bert-base-uncased'),
             'eeg_arch': eeg_arch,
@@ -653,7 +723,7 @@ def initialize_wandb(config):
 
 def train_alignment_model(model, train_dataloader, val_dataloader, test_dataloader,
                           optimizer, num_epochs, patience=10, device='cuda',
-                          debug=False, config=None):
+                          debug=False, config=None, multi_positive_eval=False):
     """
     Complete training loop with validation and early stopping
     """
@@ -671,6 +741,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Dataset: {dataset_name}")
     print(f"Subject mode: {subject_mode}")
     print(f"Pooling strategy: {pooling_strategy}")
+    print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
     print(f"Early stopping patience: {patience}")
 
     # Early stopping variables
@@ -726,7 +797,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
         # Ranking evaluation every 3rd epoch
         if epoch_num % 3 == 0:
             ranking_metrics = perform_ranking_evaluation(
-                model, val_dataloader, device, epoch_num, subset_size=300
+                model, val_dataloader, device, epoch_num, subset_size=300,
+                multi_positive_eval=multi_positive_eval  # PASS THE FLAG
             )
 
         # Log epoch-level metrics
@@ -760,7 +832,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     # Final test evaluation
     print(f"\n=== FINAL TEST EVALUATION ===")
     test_ranking_metrics = perform_ranking_evaluation(
-        model, test_dataloader, device, epoch_num=-1, subset_size=300  # Use all docs for test
+        model, test_dataloader, device, epoch_num=-1, subset_size=300,
+        multi_positive_eval=multi_positive_eval  # PASS THE FLAG
     )
 
     # Rename test metrics
@@ -784,6 +857,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"\nEEG-{document_type.upper()} alignment training completed!")
     print(f"Dataset: {dataset_name}")
     print(f"Subject mode: {subject_mode}")
+    print(f"Multi-positive eval: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
     if early_stopped:
         print(f"Stopped early after {epoch_num} epochs")
     print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")

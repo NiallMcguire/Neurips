@@ -58,18 +58,20 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
                                   max_eeg_len=50, train_ratio=0.8, debug=False,
                                   dataset_type='auto', holdout_subjects=False,
                                   document_type='text', global_eeg_dims=None,
-                                  subject_mode='within-subject'):
+                                  subject_mode='within-subject', multi_positive_eval=False):
     """
     Create simplified dataloaders for EEG alignment experiments
 
     Args:
         document_type: 'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
         subject_mode: 'within-subject' or 'cross-subject'
+        multi_positive_eval: If True, treat all recordings of same document as relevant during evaluation
     """
     print(f"Loading data from: {data_path}")
     print(f"Document type: {document_type.upper()}")
     print(f"Subject mode: {subject_mode}")
     print(f"Split strategy: {'holdout subjects' if holdout_subjects else 'random sample'}")
+    print(f"Multi-positive evaluation: {'ENABLED' if multi_positive_eval else 'DISABLED'}")
 
     # Compute global EEG dimensions if not provided
     if global_eeg_dims is None:
@@ -119,7 +121,6 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
     print(f"Test: {len(test_dataset)} samples from {len(test_dataset.unique_subjects)} subjects")
 
     return train_dataloader, val_dataloader, test_dataloader, global_eeg_dims
-
 
 def inspect_dataset(data_path, dataset_type='auto'):
     """Inspect dataset structure and content"""
@@ -208,6 +209,10 @@ def main():
     parser.add_argument('--pooling_strategy', default='multi', choices=['multi', 'cls', 'max', 'mean'],
                         help='Pooling strategy for representations')
 
+    # Evaluation arguments
+    parser.add_argument('--multi_positive_eval', action='store_true',
+                        help='Enable multi-positive evaluation: treat all recordings of same document as relevant (recommended for cross-subject)')
+
     # Model arguments
     parser.add_argument('--colbert_model_name', default='colbert-ir/colbertv2.0',
                         help='ColBERT model name (for text encoding)')
@@ -274,7 +279,8 @@ def main():
         max_text_len=args.max_text_len, max_eeg_len=args.max_eeg_len,
         train_ratio=args.train_ratio, debug=args.debug,
         dataset_type=args.dataset_type, holdout_subjects=args.holdout_subjects,
-        document_type=args.document_type, subject_mode=args.subject_mode
+        document_type=args.document_type, subject_mode=args.subject_mode,
+        multi_positive_eval=args.multi_positive_eval
     )
 
     train_subjects = len(train_dataloader.dataset.unique_subjects)
@@ -297,6 +303,7 @@ def main():
         'subject_mode': args.subject_mode,
         'alignment_task': f'EEG-{args.document_type.upper()}',
         'alignment_method': args.subject_mode,
+        'multi_positive_eval': args.multi_positive_eval,  # NEW
 
         # Model config
         'colbert_model_name': args.colbert_model_name,
@@ -337,6 +344,9 @@ def main():
     print(f"Subject Mode: {args.subject_mode}")
     print(f"Pooling Strategy: {args.pooling_strategy}")
     print(f"EEG Architecture: {args.eeg_arch}")
+    print(f"Multi-Positive Eval: {'✅ ENABLED' if args.multi_positive_eval else '❌ DISABLED'}")  # NEW
+    if args.multi_positive_eval and args.subject_mode == 'cross-subject':
+        print(f"  → All recordings of same document will be treated as relevant")
     print(f"Training samples: {config['train_samples']} ({train_subjects} subjects)")
     print(f"Validation samples: {config['val_samples']} ({val_subjects} subjects)")
     print(f"Test samples: {config['test_samples']} ({test_subjects} subjects)")
@@ -376,6 +386,8 @@ def main():
     print(f"\n=== TRAINING START ===")
     print(f"Task: EEG queries → {args.document_type.upper()} documents")
     print(f"Method: {args.subject_mode}")
+    if args.multi_positive_eval:
+        print(f"Evaluation: Multi-positive labels enabled ✅")
 
     trained_model = train_simplified_model(
         model=model,
@@ -387,7 +399,8 @@ def main():
         patience=args.patience,
         device=device,
         debug=args.debug,
-        config=config
+        config=config,
+        multi_positive_eval=args.multi_positive_eval  # NEW - Pass to training function
     )
 
     # Save trained model
@@ -404,7 +417,10 @@ def main():
     print(f"Dataset: {dataset_name}")
     print(f"Alignment Task: EEG → {args.document_type.upper()}")
     print(f"Subject Mode: {args.subject_mode}")
+    print(f"Multi-Positive Eval: {'ENABLED ✅' if args.multi_positive_eval else 'DISABLED ❌'}")
     print(f"Results saved in: {output_dir}")
+
+
 
 
 if __name__ == "__main__":
