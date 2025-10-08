@@ -30,8 +30,7 @@ python controller.py \
     --batch_size 32 \
     --max_eeg_len 50 \
     --seed 42 \
-    --subject_mode cross-subject \
-    --multi_positive_eval \
-    --multi_positive_train  \
+    --subject_mode within-subject \
+
 
 /opt/software/scripts/job_epilogue.sh
