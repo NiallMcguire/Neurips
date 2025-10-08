@@ -15,10 +15,11 @@ from models import compute_similarity
 
 
 def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
-                             batch_metadata=None, multi_positive_train=False):
+                             batch_metadata=None, multi_positive_train=False, debug_step=False):
     """
     Compute contrastive loss for EEG alignment using in-batch negatives
     With optional multi-positive support for cross-subject learning
+    NOW WITH EXTENSIVE DEBUGGING
     """
     if pooling_strategy == 'multi':
         batch_size = len(query_vectors)
@@ -57,6 +58,43 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             sim = compute_similarity([query_i], [doc_j], pooling_strategy, temperature=1.0)
             logits[i, j] = sim[0] / temperature
 
+    # 🔍 DEBUG LOGGING - CRITICAL METRICS
+    if debug_step:
+        print("\n" + "=" * 80)
+        print("🔍 CONTRASTIVE LOSS DEBUG")
+        print("=" * 80)
+
+        # Raw similarities (before temperature scaling)
+        print(f"\n📊 RAW SIMILARITIES (temperature=1.0):")
+        print(f"  Diagonal (positive pairs):  {torch.diagonal(logits * temperature).detach().cpu().numpy()}")
+        print(f"  Min: {(logits * temperature).min().item():.4f}")
+        print(f"  Max: {(logits * temperature).max().item():.4f}")
+        print(f"  Mean: {(logits * temperature).mean().item():.4f}")
+        print(f"  Std: {(logits * temperature).std().item():.4f}")
+
+        # Logits after temperature scaling
+        print(f"\n🌡️  LOGITS (after dividing by temperature={temperature}):")
+        print(f"  Diagonal (positive pairs):  {torch.diagonal(logits).detach().cpu().numpy()}")
+        print(f"  Min: {logits.min().item():.4f}")
+        print(f"  Max: {logits.max().item():.4f}")
+        print(f"  Mean: {logits.mean().item():.4f}")
+        print(f"  Std: {logits.std().item():.4f}")
+
+        # Exponentials (this is where explosion happens!)
+        exp_logits = torch.exp(logits)
+        print(f"\n💥 EXPONENTIALS (exp(logits)):")
+        print(f"  Diagonal (positive pairs):  {torch.diagonal(exp_logits).detach().cpu().numpy()}")
+        print(f"  Min: {exp_logits.min().item():.2e}")
+        print(f"  Max: {exp_logits.max().item():.2e}")
+        print(f"  Mean: {exp_logits.mean().item():.2e}")
+        print(f"  RANGE (max/min): {(exp_logits.max() / exp_logits.min()).item():.2e}")
+
+        # Check for numerical instability
+        if exp_logits.max().item() > 1e10:
+            print(f"  ⚠️  WARNING: Exponentials > 1e10 (numerical instability risk!)")
+        if (exp_logits.max() / exp_logits.min()).item() > 1e8:
+            print(f"  ⚠️  WARNING: Exponential range > 1e8 (gradient explosion risk!)")
+
     # Multi-positive training: identify in-batch positives by sentence_id
     if multi_positive_train and batch_metadata is not None:
         # Extract sentence IDs and document type
@@ -74,9 +112,15 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
                     if sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
                         labels_matrix[i, j] = 1.0
 
+            # 🔍 DEBUG: Multi-positive statistics
+            if debug_step:
+                print(f"\n🎯 MULTI-POSITIVE TRAINING:")
+                positives_per_query = labels_matrix.sum(dim=1)
+                print(f"  Positives per query: {positives_per_query.detach().cpu().numpy()}")
+                print(f"  Avg positives per query: {positives_per_query.mean().item():.2f}")
+                print(f"  Sentence IDs in batch: {set(sentence_ids)}")
+
             # Compute multi-positive contrastive loss
-            # Numerator: sum of exp(sim) for all positives
-            # Denominator: sum of exp(sim) for all samples
             exp_logits = torch.exp(logits)
 
             # For each query, compute loss
@@ -95,6 +139,15 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
                     loss_i = -torch.log(positive_sum / all_sum)
                     losses.append(loss_i)
 
+                    # 🔍 DEBUG: Per-query loss breakdown
+                    if debug_step:
+                        print(f"\n  Query {i}:")
+                        print(f"    Positives: {num_positives}")
+                        print(f"    Positive sum: {positive_sum.item():.2e}")
+                        print(f"    All sum: {all_sum.item():.2e}")
+                        print(f"    Ratio: {(positive_sum / all_sum).item():.4f}")
+                        print(f"    Loss: {loss_i.item():.4f}")
+
             if losses:
                 loss = torch.stack(losses).mean()
             else:
@@ -110,8 +163,20 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         labels = torch.arange(batch_size, device=device)
         loss = F.cross_entropy(logits, labels)
 
-    return loss, similarities
+        # 🔍 DEBUG: Standard contrastive loss
+        if debug_step:
+            print(f"\n🎯 STANDARD CONTRASTIVE LOSS:")
+            print(f"  Labels: {labels.detach().cpu().numpy()}")
+            print(f"  Loss: {loss.item():.4f}")
 
+    # 🔍 DEBUG: Final loss info
+    if debug_step:
+        print(f"\n📉 FINAL LOSS:")
+        print(f"  Value: {loss.item():.4f}")
+        print(f"  Requires grad: {loss.requires_grad}")
+        print("=" * 80 + "\n")
+
+    return loss, similarities
 
 def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, document_type):
     """Compute alignment metrics between query and document representations"""
@@ -145,7 +210,7 @@ def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, docu
 
 
 def train_step(model, batch, optimizer, device, step_num, debug=False, multi_positive_train=False):
-    """Single training step"""
+    """Single training step WITH GRADIENT ANALYSIS"""
 
     # Move batch to device
     if batch['doc_eegs'] is not None:
@@ -156,9 +221,14 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
 
     document_type = batch['document_type']
 
-    if debug:
+    # Enable debug logging every 50 steps or when explicitly debug=True
+    debug_this_step = debug or (step_num % 50 == 0)
+
+    if debug_this_step:
         subject_mode = batch['metadata'][0]['subject_mode']
-        print(f"[DEBUG] Training step {step_num} (EEG-{document_type.upper()} alignment, {subject_mode})")
+        print(f"\n{'=' * 80}")
+        print(f"🔍 DEBUG STEP {step_num} (EEG-{document_type.upper()}, {subject_mode})")
+        print(f"{'=' * 80}")
         print(f"  Query EEGs: {batch['query_eegs'].shape}")
         if document_type == 'eeg':
             print(f"  Doc EEGs: {batch['doc_eegs'].shape}")
@@ -170,15 +240,16 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
     # Forward pass
     outputs = model(batch)
 
-    if debug:
-        print(f"  Output query vectors: {type(outputs['query_vectors'])}")
-        print(f"  Output doc vectors: {type(outputs['doc_vectors'])}")
+    if debug_this_step:
+        print(f"\n📤 MODEL OUTPUTS:")
+        print(f"  Query vectors type: {type(outputs['query_vectors'])}")
+        print(f"  Doc vectors type: {type(outputs['doc_vectors'])}")
         if isinstance(outputs['query_vectors'], list):
-            print(f"    Query vector 0 shape: {outputs['query_vectors'][0].shape}")
-            print(f"    Doc vector 0 shape: {outputs['doc_vectors'][0].shape}")
+            print(f"  Query vector 0 shape: {outputs['query_vectors'][0].shape}")
+            print(f"  Doc vector 0 shape: {outputs['doc_vectors'][0].shape}")
         else:
-            print(f"    Query vectors shape: {outputs['query_vectors'].shape}")
-            print(f"    Doc vectors shape: {outputs['doc_vectors'].shape}")
+            print(f"  Query vectors shape: {outputs['query_vectors'].shape}")
+            print(f"  Doc vectors shape: {outputs['doc_vectors'].shape}")
 
     # Compute contrastive loss with multi-positive support
     loss, query_sims = compute_contrastive_loss(
@@ -186,7 +257,8 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         outputs['doc_vectors'],
         model.pooling_strategy,
         batch_metadata=batch['metadata'],
-        multi_positive_train=multi_positive_train
+        multi_positive_train=multi_positive_train,
+        debug_step=debug_this_step
     )
 
     # Compute alignment metrics
@@ -197,12 +269,68 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         document_type
     )
 
+    # 🔍 DEBUG: Before backward pass
+    if debug_this_step:
+        print(f"\n⏪ BEFORE BACKWARD:")
+        print(f"  Loss value: {loss.item():.4f}")
+        print(f"  Loss requires_grad: {loss.requires_grad}")
+
     # Backward pass
     optimizer.zero_grad()
     loss.backward()
 
+    # 🔍 DEBUG: Gradient analysis BEFORE clipping
+    if debug_this_step:
+        print(f"\n🔬 GRADIENT ANALYSIS (before clipping):")
+        total_norm = 0.0
+        max_grad = 0.0
+        min_grad = float('inf')
+        grad_info = {}
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2).item()
+                param_max = param.grad.data.abs().max().item()
+                param_min = param.grad.data.abs().min().item()
+                total_norm += param_norm ** 2
+                max_grad = max(max_grad, param_max)
+                min_grad = min(min_grad, param_min)
+
+                # Store for key layers
+                if 'eeg_encoder' in name or 'projection' in name:
+                    grad_info[name] = {
+                        'norm': param_norm,
+                        'max': param_max,
+                        'min': param_min,
+                        'mean': param.grad.data.abs().mean().item()
+                    }
+
+        total_norm = total_norm ** 0.5
+        print(f"  Total gradient norm (unclipped): {total_norm:.4f}")
+        print(f"  Max gradient value: {max_grad:.6f}")
+        print(f"  Min gradient value: {min_grad:.6f}")
+        print(f"  Gradient range (max/min): {(max_grad / min_grad if min_grad > 0 else float('inf')):.2e}")
+
+        print(f"\n  Key layer gradients:")
+        for name, info in list(grad_info.items())[:5]:  # Show first 5
+            print(f"    {name[:50]:50s} norm={info['norm']:.4f} max={info['max']:.6f}")
+
+        # Check for gradient issues
+        if total_norm > 10.0:
+            print(f"  ⚠️  WARNING: Large gradients detected (norm={total_norm:.2f})")
+        if max_grad > 1.0:
+            print(f"  ⚠️  WARNING: Gradient values > 1.0 (max={max_grad:.4f})")
+        if (max_grad / min_grad) > 1e6:
+            print(f"  ⚠️  WARNING: Huge gradient range (may cause instability)")
+
     # Clip gradients
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    if debug_this_step:
+        print(f"\n✂️  AFTER GRADIENT CLIPPING:")
+        print(f"  Gradient norm (clipped): {grad_norm.item():.4f}")
+        if grad_norm.item() > 1.0:
+            print(f"  ⚠️  Clipping applied! (was > 1.0)")
 
     optimizer.step()
 
@@ -217,7 +345,8 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
 
     wandb.log(log_dict)
 
-    if debug:
+    if debug_this_step:
+        print(f"\n📊 METRICS:")
         print(f"  Loss: {loss.item():.4f}")
         print(f"  EEG-{document_type.upper()} similarity: {metrics[f'eeg_{document_type}_similarity']:.4f}")
         print(f"  Grad norm: {grad_norm.item():.4f}")
@@ -225,9 +354,101 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         print(f"  Sample query: '{meta['query_text'][:50]}...'")
         print(f"  Query participant: {meta['query_participant_id']}")
         print(f"  Doc participant: {meta['doc_participant_id']}")
+        print(f"{'=' * 80}\n")
 
     return loss.item(), metrics, grad_norm.item()
 
+
+def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.5]):
+    """
+    Test how different temperatures affect the loss landscape
+    Call this during training to diagnose temperature issues
+    """
+    print("\n" + "=" * 80)
+    print("🌡️  TEMPERATURE SENSITIVITY ANALYSIS")
+    print("=" * 80)
+
+    model.eval()
+
+    # Move batch to device
+    if batch['doc_eegs'] is not None:
+        batch['doc_eegs'] = batch['doc_eegs'].to(device)
+    if batch['doc_text_tokens'] is not None:
+        batch['doc_text_tokens'] = {k: v.to(device) for k, v in batch['doc_text_tokens'].items()}
+    batch['query_eegs'] = batch['query_eegs'].to(device)
+
+    with torch.no_grad():
+        # Forward pass
+        outputs = model(batch)
+
+        print(f"\nTesting {len(temperatures)} different temperatures:")
+        print(f"{'Temperature':>12} {'Loss':>10} {'Max Logit':>12} {'Max Exp':>15} {'Exp Range':>15}")
+        print("-" * 80)
+
+        results = []
+        for temp in temperatures:
+            # Compute loss with this temperature
+            loss, sims = compute_contrastive_loss(
+                outputs['query_vectors'],
+                outputs['doc_vectors'],
+                model.pooling_strategy,
+                temperature=temp,
+                batch_metadata=batch['metadata'],
+                multi_positive_train=False,
+                debug_step=False
+            )
+
+            # Compute statistics
+            batch_size = len(outputs['query_vectors']) if isinstance(outputs['query_vectors'], list) else outputs[
+                'query_vectors'].size(0)
+
+            # Recompute logits to get statistics
+            logits = torch.zeros(batch_size, batch_size, device=device)
+            for i in range(batch_size):
+                for j in range(batch_size):
+                    if isinstance(outputs['query_vectors'], list):
+                        q_i = outputs['query_vectors'][i]
+                        d_j = outputs['doc_vectors'][j]
+                    else:
+                        q_i = outputs['query_vectors'][i:i + 1]
+                        d_j = outputs['doc_vectors'][j:j + 1]
+                    sim = compute_similarity([q_i], [d_j], model.pooling_strategy, temperature=1.0)
+                    logits[i, j] = sim[0] / temp
+
+            exp_logits = torch.exp(logits)
+            max_logit = logits.max().item()
+            max_exp = exp_logits.max().item()
+            exp_range = (exp_logits.max() / exp_logits.min()).item()
+
+            results.append({
+                'temp': temp,
+                'loss': loss.item(),
+                'max_logit': max_logit,
+                'max_exp': max_exp,
+                'exp_range': exp_range
+            })
+
+            # Color code based on stability
+            stability = "✓" if exp_range < 1e6 and max_exp < 1e8 else "⚠️" if exp_range < 1e8 else "❌"
+            print(
+                f"{temp:>12.3f} {loss.item():>10.4f} {max_logit:>12.2f} {max_exp:>15.2e} {exp_range:>15.2e} {stability}")
+
+        print("\n💡 RECOMMENDATIONS:")
+        stable_temps = [r for r in results if r['exp_range'] < 1e6 and r['max_exp'] < 1e8]
+        if stable_temps:
+            print(f"  ✓ Stable temperatures (exp_range < 1e6): {[r['temp'] for r in stable_temps]}")
+            print(f"  📌 Recommended: temperature >= {min(r['temp'] for r in stable_temps):.2f}")
+        else:
+            print(f"  ⚠️  All temperatures show instability - consider even higher temperatures")
+
+        unstable_temps = [r for r in results if r['exp_range'] > 1e8 or r['max_exp'] > 1e10]
+        if unstable_temps:
+            print(f"  ❌ Unstable temperatures (risk of explosion): {[r['temp'] for r in unstable_temps]}")
+
+        print("=" * 80 + "\n")
+
+    model.train()
+    return results
 
 def validation_step(model, batch, device):
     """Single validation step"""
@@ -606,7 +827,7 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
 # ==========================================
 
 def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False, multi_positive_train=False):
-    """Train for a single epoch"""
+    """Train for a single epoch WITH PERIODIC DEBUGGING"""
 
     model.train()
     total_loss = 0
@@ -616,8 +837,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
 
     document_type = None
 
+    # Run temperature sensitivity test at start of epoch 1
+    if epoch_num == 1 and num_batches == 0:
+        first_batch = next(iter(dataloader))
+        print("\n🔬 Running temperature sensitivity analysis on first batch...")
+        debug_temperature_sensitivity(model, first_batch, device)
+
     for batch_idx, batch in enumerate(dataloader):
-        # Debug first batch of first epoch
+        # Debug first batch of first epoch with full detail
         debug_this_batch = debug and epoch_num == 1 and batch_idx == 0
 
         # Calculate global step
@@ -627,7 +854,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
         if document_type is None:
             document_type = batch['document_type']
 
-        # Training step
+        # Training step (with automatic debug logging every 50 steps)
         loss, metrics, grad_norm = train_step(
             model, batch, optimizer, device, step_num, debug=debug_this_batch,
             multi_positive_train=multi_positive_train
@@ -641,15 +868,23 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
         # Progress logging
         if batch_idx % 20 == 0:
             print(f"Epoch {epoch_num}/{total_epochs}, Batch {batch_idx + 1}/{len(dataloader)}, "
-                  f"Loss: {loss:.4f}, EEG-{document_type.upper()} Sim: {metrics[f'eeg_{document_type}_similarity']:.4f}")
+                  f"Loss: {loss:.4f}, EEG-{document_type.upper()} Sim: {metrics[f'eeg_{document_type}_similarity']:.4f}, "
+                  f"Grad Norm: {grad_norm:.2f}")
 
     # Compute epoch statistics
     avg_loss = total_loss / num_batches
     avg_similarity = np.mean(epoch_similarities)
     avg_grad_norm = np.mean(epoch_grad_norms)
+    max_grad_norm = np.max(epoch_grad_norms)
 
-    print(f"Epoch {epoch_num} training completed. "
-          f"Avg Loss: {avg_loss:.4f}, Avg EEG-{document_type.upper()} Sim: {avg_similarity:.4f}")
+    print(f"\n📊 Epoch {epoch_num} Summary:")
+    print(f"  Avg Loss: {avg_loss:.4f}")
+    print(f"  Avg EEG-{document_type.upper()} Sim: {avg_similarity:.4f}")
+    print(f"  Avg Grad Norm: {avg_grad_norm:.2f}")
+    print(f"  Max Grad Norm: {max_grad_norm:.2f}")
+
+    if max_grad_norm > 5.0:
+        print(f"  ⚠️  WARNING: High gradient norms detected (max={max_grad_norm:.2f})")
 
     return avg_loss, avg_similarity, avg_grad_norm
 
