@@ -31,5 +31,6 @@ python controller.py \
     --max_eeg_len 50 \
     --seed 42 \
     --subject_mode within-subject \
+    --multi_positive_eval
 
 /opt/software/scripts/job_epilogue.sh
