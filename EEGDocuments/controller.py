@@ -221,6 +221,8 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=768, help='Hidden dimension size')
     parser.add_argument('--eeg_arch', default='simple', choices=['simple', 'complex', 'transformer'],
                         help='EEG encoder architecture')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='Weight decay for L2 regularization')
 
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
@@ -230,6 +232,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
 
     # Experiment arguments
     parser.add_argument('--output_dir', default=None, help='Output directory (default: auto-generated)')
@@ -322,6 +325,8 @@ def main():
         'learning_rate': args.lr,
         'epochs': args.epochs,
         'patience': args.patience,
+        'weight_decay': args.weight_decay,
+        'dropout': args.dropout,
 
         # Data config
         'holdout_subjects': args.holdout_subjects,
@@ -367,7 +372,8 @@ def main():
         eeg_arch=args.eeg_arch,
         pooling_strategy=args.pooling_strategy,
         global_eeg_dims=global_eeg_dims,
-        device=device
+        device=device,
+        dropout=args.dropout  # NEW: pass dropout
     )
 
     # Update tokenizer vocab size if needed
@@ -388,7 +394,14 @@ def main():
     save_experiment_config(config, output_dir)
 
     # Create optimizer and train
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,  # NEW: L2 regularization
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    print(f"Optimizer: AdamW (lr={args.lr}, weight_decay={args.weight_decay})")
     print(f"\n=== TRAINING START ===")
     print(f"Task: EEG queries → {args.document_type.upper()} documents")
     print(f"Method: {args.subject_mode}")

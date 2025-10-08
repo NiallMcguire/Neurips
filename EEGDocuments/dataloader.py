@@ -144,8 +144,8 @@ class SimplifiedEEGDataloader(Dataset):
         self.normalize_eeg = normalize_eeg
         self.debug = debug
         self.holdout_subjects = holdout_subjects
-        self.document_type = document_type  # 'text' or 'eeg'
-        self.subject_mode = subject_mode  # 'within-subject' or 'cross-subject'
+        self.document_type = document_type
+        self.subject_mode = subject_mode
 
         # Set global EEG dimensions
         if global_eeg_dims is not None:
@@ -192,7 +192,7 @@ class SimplifiedEEGDataloader(Dataset):
                 print(f"✅ Dataset has {len(unique_subjects)} subjects for cross-subject pairing")
 
         # Create train/val/test split
-        random.seed(42)  # Fixed seed for reproducible splits
+        random.seed(42)
 
         if holdout_subjects:
             if self.debug:
@@ -204,6 +204,11 @@ class SimplifiedEEGDataloader(Dataset):
             self.indices, self.unique_subjects = self._create_random_split(split, train_ratio)
 
         self.pairs = [self.ict_pairs[i] for i in self.indices]
+
+        # 🔥 NEW: Compute per-subject statistics for normalization
+        print(f"Computing per-subject EEG statistics for normalization...")
+        self.subject_stats = self._compute_subject_statistics()
+        print(f"  Computed stats for {len(self.subject_stats)} subjects")
 
         # For cross-subject mode, build sentence-to-subject mapping
         if subject_mode == 'cross-subject' and document_type == 'eeg':
@@ -218,6 +223,73 @@ class SimplifiedEEGDataloader(Dataset):
                 f"{split} split: {len(self.processed_pairs)} samples from {len(self.unique_subjects)} unique subjects")
             if len(self.processed_pairs) > 0:
                 self._debug_print_sample(0)
+
+    def _compute_subject_statistics(self):
+        """
+        Compute per-subject mean and std for EEG normalization
+        This is CRITICAL for cross-subject generalization
+        """
+        subject_eegs = {}  # participant_id -> list of EEG arrays
+
+        # Collect all EEG data per subject
+        for pair in self.pairs:
+            participant_id = pair.get('participant_id', 'unknown')
+
+            # Collect query EEG
+            query_eeg = pair.get('query_eeg', None)
+            if query_eeg is not None:
+                if participant_id not in subject_eegs:
+                    subject_eegs[participant_id] = []
+                subject_eegs[participant_id].append(np.array(query_eeg, dtype=np.float32))
+
+            # Collect doc EEG if available (for EEG-EEG alignment)
+            if self.document_type == 'eeg':
+                doc_eeg = pair.get('doc_eeg', None)
+                if doc_eeg is not None:
+                    subject_eegs[participant_id].append(np.array(doc_eeg, dtype=np.float32))
+
+        # Compute statistics per subject
+        subject_stats = {}
+        for participant_id, eeg_list in subject_eegs.items():
+            if len(eeg_list) == 0:
+                continue
+
+            # Concatenate all EEG data for this subject
+            try:
+                # Flatten all dimensions except the last (channels)
+                all_values = []
+                for eeg in eeg_list:
+                    eeg_array = np.array(eeg, dtype=np.float32)
+                    if len(eeg_array.shape) >= 2:
+                        # Flatten to get all channel values
+                        all_values.append(eeg_array.reshape(-1))
+
+                if all_values:
+                    combined = np.concatenate(all_values)
+                    # Remove zeros (padding)
+                    non_zero = combined[combined != 0]
+
+                    if len(non_zero) > 0:
+                        subject_mean = np.mean(non_zero)
+                        subject_std = np.std(non_zero)
+
+                        # Avoid division by zero
+                        if subject_std < 1e-6:
+                            subject_std = 1.0
+
+                        subject_stats[participant_id] = {
+                            'mean': float(subject_mean),
+                            'std': float(subject_std)
+                        }
+
+                        if self.debug and len(subject_stats) <= 3:
+                            print(f"    Subject {participant_id}: mean={subject_mean:.4f}, std={subject_std:.4f}")
+            except Exception as e:
+                if self.debug:
+                    print(f"    Warning: Could not compute stats for subject {participant_id}: {e}")
+                continue
+
+        return subject_stats
 
     def _build_sentence_subject_mapping(self):
         """Build mapping of sentences to subjects for cross-subject pairing"""
@@ -470,17 +542,35 @@ class SimplifiedEEGDataloader(Dataset):
                 print(f"EEG processing failed: {e}")
             return None
 
-    def _normalize_eeg(self, eeg_tensor):
-        """Normalize EEG tensor for better training stability"""
+    def _normalize_eeg(self, eeg_tensor, participant_id='unknown'):
+        """
+        Normalize EEG tensor using SUBJECT-SPECIFIC statistics
+        This is critical for cross-subject generalization
+        """
         if not self.normalize_eeg:
             return eeg_tensor
 
-        if len(eeg_tensor.shape) == 3:
-            mean = torch.mean(eeg_tensor, dim=1, keepdim=True)
-            std = torch.std(eeg_tensor, dim=1, keepdim=True)
-            std = torch.where(std == 0, torch.tensor(1e-6), std)
-            return (eeg_tensor - mean) / std
+        # Use subject-specific normalization if available
+        if participant_id in self.subject_stats:
+            stats = self.subject_stats[participant_id]
+            subject_mean = stats['mean']
+            subject_std = stats['std']
+
+            # Apply subject-wise z-score normalization
+            normalized = (eeg_tensor - subject_mean) / subject_std
+            return normalized
         else:
+            # Fallback to global normalization if subject stats not available
+            if len(eeg_tensor.shape) == 3:
+                # Create mask for non-zero values
+                non_zero_mask = (eeg_tensor.abs().sum(dim=(1, 2)) > 0).unsqueeze(1).unsqueeze(2)
+
+                if non_zero_mask.sum() > 0:
+                    mean = torch.mean(eeg_tensor[non_zero_mask])
+                    std = torch.std(eeg_tensor[non_zero_mask])
+                    std = torch.where(std == 0, torch.tensor(1e-6), std)
+                    return (eeg_tensor - mean) / std
+
             return eeg_tensor
 
     def _tokenize_text(self, text):
@@ -521,23 +611,23 @@ class SimplifiedEEGDataloader(Dataset):
         return len(self.processed_pairs)
 
     def __getitem__(self, idx):
-        """Get sample for training"""
+        """Get sample for training with subject-wise normalization"""
         sample = self.processed_pairs[idx]
 
-        # Process query EEG (always present)
+        # Process query EEG (always present) with subject-specific normalization
         query_eeg_tensor = torch.tensor(sample['query_eeg'], dtype=torch.float32)
-        query_eeg_tensor = self._normalize_eeg(query_eeg_tensor)
+        query_eeg_tensor = self._normalize_eeg(query_eeg_tensor, sample['query_participant_id'])
 
         # Process document based on type
         if self.document_type == 'eeg':
-            # EEG-EEG alignment
+            # EEG-EEG alignment with subject-specific normalization
             doc_eeg_tensor = torch.tensor(sample['doc_eeg'], dtype=torch.float32)
-            doc_eeg_tensor = self._normalize_eeg(doc_eeg_tensor)
+            doc_eeg_tensor = self._normalize_eeg(doc_eeg_tensor, sample['doc_participant_id'])
 
             return {
                 'query_eeg': query_eeg_tensor,
                 'doc_eeg': doc_eeg_tensor,
-                'doc_text_tokens': None,  # Not used
+                'doc_text_tokens': None,
                 'metadata': {
                     'query_participant_id': sample['query_participant_id'],
                     'doc_participant_id': sample['doc_participant_id'],
@@ -555,7 +645,7 @@ class SimplifiedEEGDataloader(Dataset):
 
             return {
                 'query_eeg': query_eeg_tensor,
-                'doc_eeg': None,  # Not used
+                'doc_eeg': None,
                 'doc_text_tokens': doc_tokens,
                 'metadata': {
                     'query_participant_id': sample['query_participant_id'],

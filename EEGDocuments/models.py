@@ -12,9 +12,9 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 
 class EEGEncoder(nn.Module):
-    """EEG encoder with different architecture options"""
+    """EEG encoder with different architecture options and STRONG regularization"""
 
-    def __init__(self, input_size, hidden_dim=768, arch='simple', dropout=0.1):
+    def __init__(self, input_size, hidden_dim=768, arch='simple', dropout=0.3):  # INCREASED from 0.1
         super().__init__()
         self.arch = arch
         self.hidden_dim = hidden_dim
@@ -22,36 +22,44 @@ class EEGEncoder(nn.Module):
         if arch == 'simple':
             self.encoder = nn.Sequential(
                 nn.Linear(input_size, hidden_dim),
+                nn.LayerNorm(hidden_dim),  # Added LayerNorm
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),  # Added LayerNorm
                 nn.ReLU(),
+                nn.Dropout(dropout),  # Added dropout
                 nn.Linear(hidden_dim, hidden_dim)
             )
         elif arch == 'complex':
             self.encoder = nn.Sequential(
                 nn.Linear(input_size, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
+                nn.LayerNorm(hidden_dim),  # Changed from BatchNorm1d
                 nn.ReLU(),
                 nn.Dropout(dropout * 2),
                 nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.BatchNorm1d(hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2),  # Changed from BatchNorm1d
                 nn.ReLU(),
                 nn.Dropout(dropout * 2),
-                nn.Linear(hidden_dim * 2, hidden_dim)
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Dropout(dropout)  # Added final dropout
             )
         elif arch == 'transformer':
             self.input_projection = nn.Linear(input_size, hidden_dim)
+            self.input_norm = nn.LayerNorm(hidden_dim)  # Added normalization
+
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
                 nhead=8,
                 dim_feedforward=hidden_dim * 2,
                 dropout=dropout,
                 activation='relu',
-                batch_first=True
+                batch_first=True,
+                norm_first=True  # Pre-norm architecture for stability
             )
             self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
             self.output_projection = nn.Linear(hidden_dim, hidden_dim)
+            self.output_dropout = nn.Dropout(dropout)  # Added dropout
         else:
             raise ValueError(f"Unknown EEG architecture: {arch}")
 
@@ -63,12 +71,14 @@ class EEGEncoder(nn.Module):
             [batch, num_words, hidden_dim] or [batch*num_words, hidden_dim]
         """
         if self.arch == 'transformer':
-            # x should be [batch, num_words, input_size]
             x = self.input_projection(x)
-            # Create padding mask (True = padded position)
+            x = self.input_norm(x)  # Normalize after projection
+
+            # Create padding mask
             padding_mask = (x.abs().sum(dim=-1) == 0)
             x = self.transformer(x, src_key_padding_mask=padding_mask)
             x = self.output_projection(x)
+            x = self.output_dropout(x)  # Apply dropout
         else:
             x = self.encoder(x)
 
@@ -127,10 +137,10 @@ class EEGAlignmentModel(nn.Module):
 
     def __init__(self, document_type='text', colbert_model_name='bert-base-uncased',
                  hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
-                 use_lora=True, lora_r=16, lora_alpha=32, dropout=0.1):
+                 use_lora=True, lora_r=16, lora_alpha=32, dropout=0.3):  # INCREASED from 0.1
         super().__init__()
 
-        self.document_type = document_type  # 'text' or 'eeg'
+        self.document_type = document_type
         self.pooling_strategy = pooling_strategy
         self.hidden_dim = hidden_dim
         self.eeg_arch = eeg_arch
@@ -138,10 +148,12 @@ class EEGAlignmentModel(nn.Module):
         print(f"Creating EEG-{document_type.upper()} alignment model")
         print(f"Pooling strategy: {pooling_strategy}")
         print(f"EEG architecture: {eeg_arch}")
+        print(f"Dropout: {dropout}")  # Log dropout rate
 
         # EEG encoder for queries (always needed)
-        self.eeg_encoder = None  # Created dynamically based on input size
+        self.eeg_encoder = None
         self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.eeg_proj_dropout = nn.Dropout(dropout)  # Added dropout after projection
 
         # Document encoder based on type
         if document_type == 'text':
@@ -152,10 +164,10 @@ class EEGAlignmentModel(nn.Module):
                 lora_r=lora_r,
                 lora_alpha=lora_alpha
             )
-            self.doc_eeg_encoder = None  # Not needed
+            self.doc_eeg_encoder = None
         elif document_type == 'eeg':
-            self.text_encoder = None  # Not needed
-            self.doc_eeg_encoder = None  # Will share with query encoder
+            self.text_encoder = None
+            self.doc_eeg_encoder = None
         else:
             raise ValueError(f"document_type must be 'text' or 'eeg', got {document_type}")
 
@@ -166,16 +178,16 @@ class EEGAlignmentModel(nn.Module):
             if document_type == 'eeg':
                 self.doc_eeg_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
 
-            # CLS transformer for attention-based aggregation
+            # CLS transformer
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim, nhead=8, dim_feedforward=hidden_dim * 2,
-                dropout=dropout, batch_first=True
+                dropout=dropout, batch_first=True, norm_first=True  # Pre-norm
             )
             self.cls_transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
 
         self.dropout = nn.Dropout(dropout)
 
-        print(f"Model initialized for {document_type.upper()} documents")
+        print(f"Model initialized for {document_type.upper()} documents with dropout={dropout}")
 
     def set_tokenizer_vocab_size(self, vocab_size):
         """Update tokenizer vocab size - only relevant for text documents with custom tokenizers"""
@@ -192,15 +204,11 @@ class EEGAlignmentModel(nn.Module):
     def encode_eeg(self, eeg_input, is_document=False):
         """
         Encode EEG sequences with specified pooling strategy
-
-        Args:
-            eeg_input: [batch, num_words, time_samples, channels]
-            is_document: Whether this is document EEG (for EEG-EEG alignment)
         """
         batch_size, num_words, time_samples, channels = eeg_input.shape
         input_size = time_samples * channels
 
-        # Create EEG encoder if needed (shared for queries and documents)
+        # Create EEG encoder if needed
         if self.eeg_encoder is None:
             self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device)
 
@@ -215,7 +223,8 @@ class EEGAlignmentModel(nn.Module):
 
         # Project and apply dropout
         word_representations = self.eeg_projection(word_representations)
-        word_representations = self.dropout(word_representations)
+        word_representations = self.eeg_proj_dropout(word_representations)  # Use separate dropout
+        word_representations = self.dropout(word_representations)  # Additional dropout
 
         # Apply pooling strategy
         return self._apply_pooling(word_representations, eeg_input, is_document)
@@ -464,7 +473,7 @@ def compute_single_vector_similarity(query_vectors, doc_vectors, temperature=1.0
 
 def create_alignment_model(document_type='text', colbert_model_name='bert-base-uncased',
                            hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
-                           global_eeg_dims=None, device='cuda'):
+                           global_eeg_dims=None, device='cuda', dropout=0.3):  # NEW parameter
     """Create EEG alignment model"""
 
     model = EEGAlignmentModel(
@@ -473,9 +482,10 @@ def create_alignment_model(document_type='text', colbert_model_name='bert-base-u
         hidden_dim=hidden_dim,
         eeg_arch=eeg_arch,
         pooling_strategy=pooling_strategy,
-        use_lora=True,  # Always use LoRA for text encoder
+        use_lora=True,
         lora_r=16,
-        lora_alpha=32
+        lora_alpha=32,
+        dropout=dropout  # NEW: pass dropout
     )
 
     return model.to(device)

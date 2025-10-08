@@ -24,13 +24,16 @@ python controller.py \
     --pooling_strategy max \
     --eeg_arch transformer \
     --hidden_dim 768 \
-    --lr 1e-4 \
+    --lr 5e-5 \
+    --weight_decay 0.01 \
+    --dropout 0.3 \
     --patience 10 \
     --epochs 50 \
-    --batch_size 32 \
+    --batch_size 64 \
     --max_eeg_len 50 \
     --seed 42 \
-    --subject_mode within-subject \
-
+    --subject_mode cross-subject \
+    --multi_positive_eval \
+    --multi_positive_train
 
 /opt/software/scripts/job_epilogue.sh
