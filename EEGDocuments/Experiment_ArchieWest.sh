@@ -18,7 +18,7 @@ module load anaconda/python-3.9.7/2021.11
 
 # EEG-EEG ALIGNMENT: Match EEG queries to EEG documents
 python controller.py \
-    --data_path /users/gxb18167/.../nieuwland_ict_pairs_RUNTIME_MASKING.npy \
+    --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     --dataset_type nieuwland \
     --document_type eeg \
     --pooling_strategy max \
@@ -32,6 +32,6 @@ python controller.py \
     --seed 42 \
     --subject_mode cross-subject \
     --multi_positive_eval \
-    --multi_positive_train
+    --multi_positive_train  \
 
 /opt/software/scripts/job_epilogue.sh
