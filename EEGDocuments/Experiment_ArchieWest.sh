@@ -21,7 +21,7 @@ python controller.py \
     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     --dataset_type nieuwland \
     --document_type eeg \
-    --pooling_strategy mean \
+    --pooling_strategy cls \
     --eeg_arch transformer \
     --hidden_dim 768 \
     --lr 5e-5 \
