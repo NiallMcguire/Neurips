@@ -14,9 +14,11 @@ from typing import Dict, List, Tuple
 from models import compute_similarity
 
 
-def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07):
+def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
+                             batch_metadata=None, multi_positive_train=False):
     """
     Compute contrastive loss for EEG alignment using in-batch negatives
+    With optional multi-positive support for cross-subject learning
     """
     if pooling_strategy == 'multi':
         batch_size = len(query_vectors)
@@ -55,11 +57,58 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             sim = compute_similarity([query_i], [doc_j], pooling_strategy, temperature=1.0)
             logits[i, j] = sim[0] / temperature
 
-    # Labels: positive pairs are on the diagonal
-    labels = torch.arange(batch_size, device=device)
+    # Multi-positive training: identify in-batch positives by sentence_id
+    if multi_positive_train and batch_metadata is not None:
+        # Extract sentence IDs and document type
+        sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
+        document_type = batch_metadata[0].get('document_type', 'text')
 
-    # Cross-entropy loss
-    loss = F.cross_entropy(logits, labels)
+        # Only apply multi-positive for EEG documents
+        if document_type == 'eeg':
+            # Create multi-positive labels matrix
+            labels_matrix = torch.zeros(batch_size, batch_size, device=device)
+
+            for i in range(batch_size):
+                for j in range(batch_size):
+                    # Mark as positive if same sentence_id
+                    if sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
+                        labels_matrix[i, j] = 1.0
+
+            # Compute multi-positive contrastive loss
+            # Numerator: sum of exp(sim) for all positives
+            # Denominator: sum of exp(sim) for all samples
+            exp_logits = torch.exp(logits)
+
+            # For each query, compute loss
+            losses = []
+            for i in range(batch_size):
+                positive_mask = labels_matrix[i] > 0
+                num_positives = positive_mask.sum()
+
+                if num_positives > 0:
+                    # Sum of similarities to all positives
+                    positive_sum = (exp_logits[i] * positive_mask).sum()
+                    # Sum of similarities to all samples
+                    all_sum = exp_logits[i].sum()
+
+                    # Multi-positive loss: -log(sum(pos) / sum(all))
+                    loss_i = -torch.log(positive_sum / all_sum)
+                    losses.append(loss_i)
+
+            if losses:
+                loss = torch.stack(losses).mean()
+            else:
+                # Fallback to standard contrastive
+                labels = torch.arange(batch_size, device=device)
+                loss = F.cross_entropy(logits, labels)
+        else:
+            # For text documents, use standard contrastive
+            labels = torch.arange(batch_size, device=device)
+            loss = F.cross_entropy(logits, labels)
+    else:
+        # Standard single-positive contrastive loss
+        labels = torch.arange(batch_size, device=device)
+        loss = F.cross_entropy(logits, labels)
 
     return loss, similarities
 
@@ -95,7 +144,7 @@ def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, docu
     return metrics
 
 
-def train_step(model, batch, optimizer, device, step_num, debug=False):
+def train_step(model, batch, optimizer, device, step_num, debug=False, multi_positive_train=False):
     """Single training step"""
 
     # Move batch to device
@@ -116,6 +165,7 @@ def train_step(model, batch, optimizer, device, step_num, debug=False):
         else:
             print(f"  Doc text tokens: {batch['doc_text_tokens']['input_ids'].shape}")
         print(f"  Pooling strategy: {model.pooling_strategy}")
+        print(f"  Multi-positive training: {'ENABLED' if multi_positive_train else 'DISABLED'}")
 
     # Forward pass
     outputs = model(batch)
@@ -130,11 +180,13 @@ def train_step(model, batch, optimizer, device, step_num, debug=False):
             print(f"    Query vectors shape: {outputs['query_vectors'].shape}")
             print(f"    Doc vectors shape: {outputs['doc_vectors'].shape}")
 
-    # Compute contrastive loss
+    # Compute contrastive loss with multi-positive support
     loss, query_sims = compute_contrastive_loss(
         outputs['query_vectors'],
         outputs['doc_vectors'],
-        model.pooling_strategy
+        model.pooling_strategy,
+        batch_metadata=batch['metadata'],
+        multi_positive_train=multi_positive_train
     )
 
     # Compute alignment metrics
@@ -553,7 +605,7 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
 # MAIN TRAINING FUNCTIONS
 # ==========================================
 
-def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False):
+def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False, multi_positive_train=False):
     """Train for a single epoch"""
 
     model.train()
@@ -577,7 +629,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
 
         # Training step
         loss, metrics, grad_norm = train_step(
-            model, batch, optimizer, device, step_num, debug=debug_this_batch
+            model, batch, optimizer, device, step_num, debug=debug_this_batch,
+            multi_positive_train=multi_positive_train
         )
 
         total_loss += loss
@@ -650,13 +703,22 @@ def initialize_wandb(config):
     eeg_arch = config.get('eeg_arch', 'simple')
     pooling_strategy = config.get('pooling_strategy', 'multi')
     version = config.get('version', 'v1')
+    multi_positive_eval = config.get('multi_positive_eval', False)
+    multi_positive_train = config.get('multi_positive_train', False)
 
     # Create descriptive run name
     alignment_type = f"eeg_{document_type}"
     subject_mode_short = subject_mode.replace('-', '_')
     split_suffix = "_holdout" if holdout_subjects else "_random"
 
-    run_name = f"{dataset_name}_{alignment_type}_{subject_mode_short}_{pooling_strategy}_{eeg_arch}{split_suffix}"
+    # Add multi-positive suffixes to run name
+    mp_suffix = ""
+    if multi_positive_eval:
+        mp_suffix += "_MPeval"
+    if multi_positive_train:
+        mp_suffix += "_MPtrain"
+
+    run_name = f"{dataset_name}_{alignment_type}_{subject_mode_short}_{pooling_strategy}_{eeg_arch}{split_suffix}{mp_suffix}"
 
     # Tags
     tags = [
@@ -669,6 +731,12 @@ def initialize_wandb(config):
         f'version-{version}',
         'holdout-subjects' if holdout_subjects else 'random-split'
     ]
+
+    # Add multi-positive tags
+    if multi_positive_eval:
+        tags.append('multi-positive-eval')
+    if multi_positive_train:
+        tags.append('multi-positive-train')
 
     wandb.init(
         project="EEG-Alignment",
@@ -687,8 +755,9 @@ def initialize_wandb(config):
             'pooling_strategy': pooling_strategy,
             'holdout_subjects': holdout_subjects,
             'split_method': 'holdout_subjects' if holdout_subjects else 'random_samples',
+            'multi_positive_eval': multi_positive_eval,  # ADDED
+            'multi_positive_train': multi_positive_train,  # ADDED
 
-            'multi_positive_eval': config.get('multi_positive_eval', False),
             # Model config
             'colbert_model_name': config.get('colbert_model_name', 'bert-base-uncased'),
             'eeg_arch': eeg_arch,
@@ -712,7 +781,7 @@ def initialize_wandb(config):
 
             # Experiment config
             'seed': config.get('seed', 42),
-            'loss_type': 'contrastive',
+            'loss_type': 'contrastive' if not multi_positive_train else 'multi_positive_contrastive',
             'similarity_function': f'{pooling_strategy}_similarity',
             'trainable_params': config.get('trainable_params', 0),
             'total_params': config.get('total_params', 0)
@@ -723,7 +792,7 @@ def initialize_wandb(config):
 
 def train_alignment_model(model, train_dataloader, val_dataloader, test_dataloader,
                           optimizer, num_epochs, patience=10, device='cuda',
-                          debug=False, config=None, multi_positive_eval=False):
+                          debug=False, config=None, multi_positive_eval=False, multi_positive_train=False):
     """
     Complete training loop with validation and early stopping
     """
@@ -742,6 +811,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Subject mode: {subject_mode}")
     print(f"Pooling strategy: {pooling_strategy}")
     print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
+    print(f"Multi-positive training: {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
     print(f"Early stopping patience: {patience}")
 
     # Early stopping variables
@@ -763,7 +833,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             device=device,
             epoch_num=epoch_num,
             total_epochs=num_epochs,
-            debug=debug
+            debug=debug,
+            multi_positive_train=multi_positive_train
         )
 
         # Validation epoch
@@ -798,7 +869,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
         if epoch_num % 3 == 0:
             ranking_metrics = perform_ranking_evaluation(
                 model, val_dataloader, device, epoch_num, subset_size=300,
-                multi_positive_eval=multi_positive_eval  # PASS THE FLAG
+                multi_positive_eval=multi_positive_eval
             )
 
         # Log epoch-level metrics
@@ -833,7 +904,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"\n=== FINAL TEST EVALUATION ===")
     test_ranking_metrics = perform_ranking_evaluation(
         model, test_dataloader, device, epoch_num=-1, subset_size=300,
-        multi_positive_eval=multi_positive_eval  # PASS THE FLAG
+        multi_positive_eval=multi_positive_eval
     )
 
     # Rename test metrics
@@ -858,6 +929,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Dataset: {dataset_name}")
     print(f"Subject mode: {subject_mode}")
     print(f"Multi-positive eval: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
+    print(f"Multi-positive train: {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
     if early_stopped:
         print(f"Stopped early after {epoch_num} epochs")
     print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")

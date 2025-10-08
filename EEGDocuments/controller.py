@@ -212,6 +212,8 @@ def main():
     # Evaluation arguments
     parser.add_argument('--multi_positive_eval', action='store_true',
                         help='Enable multi-positive evaluation: treat all recordings of same document as relevant (recommended for cross-subject)')
+    parser.add_argument('--multi_positive_train', action='store_true',
+                        help='Enable multi-positive training: treat all in-batch recordings of same sentence as positives (recommended for cross-subject)')
 
     # Model arguments
     parser.add_argument('--colbert_model_name', default='colbert-ir/colbertv2.0',
@@ -303,7 +305,8 @@ def main():
         'subject_mode': args.subject_mode,
         'alignment_task': f'EEG-{args.document_type.upper()}',
         'alignment_method': args.subject_mode,
-        'multi_positive_eval': args.multi_positive_eval,  # NEW
+        'multi_positive_eval': args.multi_positive_eval,
+        'multi_positive_train': args.multi_positive_train,  # NEW
 
         # Model config
         'colbert_model_name': args.colbert_model_name,
@@ -344,9 +347,12 @@ def main():
     print(f"Subject Mode: {args.subject_mode}")
     print(f"Pooling Strategy: {args.pooling_strategy}")
     print(f"EEG Architecture: {args.eeg_arch}")
-    print(f"Multi-Positive Eval: {'✅ ENABLED' if args.multi_positive_eval else '❌ DISABLED'}")  # NEW
+    print(f"Multi-Positive Eval: {'✅ ENABLED' if args.multi_positive_eval else '❌ DISABLED'}")
+    print(f"Multi-Positive Train: {'✅ ENABLED' if args.multi_positive_train else '❌ DISABLED'}")  # NEW
     if args.multi_positive_eval and args.subject_mode == 'cross-subject':
-        print(f"  → All recordings of same document will be treated as relevant")
+        print(f"  → All recordings of same document will be treated as relevant in evaluation")
+    if args.multi_positive_train and args.subject_mode == 'cross-subject':
+        print(f"  → All in-batch recordings of same sentence will be treated as positives in training")
     print(f"Training samples: {config['train_samples']} ({train_subjects} subjects)")
     print(f"Validation samples: {config['val_samples']} ({val_subjects} subjects)")
     print(f"Test samples: {config['test_samples']} ({test_subjects} subjects)")
@@ -388,6 +394,8 @@ def main():
     print(f"Method: {args.subject_mode}")
     if args.multi_positive_eval:
         print(f"Evaluation: Multi-positive labels enabled ✅")
+    if args.multi_positive_train:
+        print(f"Training: Multi-positive labels enabled ✅")
 
     trained_model = train_simplified_model(
         model=model,
@@ -400,7 +408,8 @@ def main():
         device=device,
         debug=args.debug,
         config=config,
-        multi_positive_eval=args.multi_positive_eval  # NEW - Pass to training function
+        multi_positive_eval=args.multi_positive_eval,
+        multi_positive_train=args.multi_positive_train  # NEW - Pass to training function
     )
 
     # Save trained model
@@ -418,6 +427,7 @@ def main():
     print(f"Alignment Task: EEG → {args.document_type.upper()}")
     print(f"Subject Mode: {args.subject_mode}")
     print(f"Multi-Positive Eval: {'ENABLED ✅' if args.multi_positive_eval else 'DISABLED ❌'}")
+    print(f"Multi-Positive Train: {'ENABLED ✅' if args.multi_positive_train else 'DISABLED ❌'}")
     print(f"Results saved in: {output_dir}")
 
 
