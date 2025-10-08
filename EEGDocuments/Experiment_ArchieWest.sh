@@ -16,7 +16,7 @@ module purge
 module load nvidia/sdk/23.3
 module load anaconda/python-3.9.7/2021.11
 
-# EEG-EEG ALIGNMENT: Match EEG queries to EEG documents
+# EEG-EEG ALIGNMENT: Match EEG queries to EEG document
 python controller.py \
     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     --dataset_type nieuwland \
