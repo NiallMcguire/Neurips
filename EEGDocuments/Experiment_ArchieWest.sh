@@ -21,12 +21,12 @@ python controller.py \
     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     --dataset_type nieuwland \
     --document_type eeg \
-    --pooling_strategy multi \
+    --pooling_strategy max \
     --eeg_arch transformer \
     --hidden_dim 768 \
-    --lr 5e-5 \
+    --lr 1e-4 \
     --weight_decay 0.01 \
-    --dropout 0.3 \
+    --dropout 0.2 \
     --patience 10 \
     --epochs 50 \
     --batch_size 64 \
