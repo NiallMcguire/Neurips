@@ -371,9 +371,9 @@ def main():
         hidden_dim=args.hidden_dim,
         eeg_arch=args.eeg_arch,
         pooling_strategy=args.pooling_strategy,
-        global_eeg_dims=global_eeg_dims,
+        global_eeg_dims=global_eeg_dims,  # Pass this!
         device=device,
-        dropout=args.dropout  # NEW: pass dropout
+        dropout=args.dropout
     )
 
     # Update tokenizer vocab size if needed

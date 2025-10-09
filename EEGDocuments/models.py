@@ -137,7 +137,8 @@ class EEGAlignmentModel(nn.Module):
 
     def __init__(self, document_type='text', colbert_model_name='bert-base-uncased',
                  hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
-                 use_lora=True, lora_r=16, lora_alpha=32, dropout=0.3):  # INCREASED from 0.1
+                 use_lora=True, lora_r=16, lora_alpha=32, dropout=0.3,
+                 global_eeg_dims=None):  # ADD THIS PARAMETER
         super().__init__()
 
         self.document_type = document_type
@@ -154,6 +155,14 @@ class EEGAlignmentModel(nn.Module):
         self.eeg_encoder = None
         self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
         self.eeg_proj_dropout = nn.Dropout(dropout)  # Added dropout after projection
+
+        if global_eeg_dims is not None:
+            max_words, max_time, max_channels = global_eeg_dims
+            input_size = max_time * max_channels
+            self.eeg_encoder = EEGEncoder(input_size, hidden_dim, eeg_arch, dropout)
+            print(f"Initialized EEG encoder with input size {input_size}")
+        else:
+            self.eeg_encoder = None
 
         # Document encoder based on type
         if document_type == 'text':
@@ -473,9 +482,7 @@ def compute_single_vector_similarity(query_vectors, doc_vectors, temperature=1.0
 
 def create_alignment_model(document_type='text', colbert_model_name='bert-base-uncased',
                            hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
-                           global_eeg_dims=None, device='cuda', dropout=0.3):  # NEW parameter
-    """Create EEG alignment model"""
-
+                           global_eeg_dims=None, device='cuda', dropout=0.3):
     model = EEGAlignmentModel(
         document_type=document_type,
         colbert_model_name=colbert_model_name,
@@ -485,7 +492,8 @@ def create_alignment_model(document_type='text', colbert_model_name='bert-base-u
         use_lora=True,
         lora_r=16,
         lora_alpha=32,
-        dropout=dropout  # NEW: pass dropout
+        dropout=dropout,
+        global_eeg_dims=global_eeg_dims  # Pass it through
     )
 
     return model.to(device)

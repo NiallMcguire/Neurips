@@ -34,5 +34,6 @@ python controller.py \
     --seed 42 \
     --subject_mode cross-subject \
     --multi_positive_eval \
+    --multi_positive_train
 
 /opt/software/scripts/job_epilogue.sh
