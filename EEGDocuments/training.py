@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Training for EEG-EEG vs EEG-Text Alignment Experiments
-Version: 2.0
+Version: 2.1
 Focus: Track dataset name, subject mode, and model version
+New: text_loss_mode support ('standard', 'masked', 'multi_positive') for EEG-Text condition
 """
 
 import torch
@@ -15,11 +16,22 @@ from models import compute_similarity
 
 
 def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
-                             batch_metadata=None, multi_positive_train=False, debug_step=False):
+                             batch_metadata=None, multi_positive_train=False, debug_step=False,
+                             text_loss_mode='standard'):
     """
-    Compute contrastive loss for EEG alignment using in-batch negatives
-    With optional multi-positive support for cross-subject learning
-    NOW WITH EXTENSIVE DEBUGGING
+    Compute contrastive loss for EEG alignment using in-batch negatives.
+
+    For EEG-EEG: supports multi_positive_train to handle multiple subjects reading
+    the same sentence as co-positives.
+
+    For EEG-Text: supports three loss modes via text_loss_mode:
+        'standard'      - Standard CE. Same-sentence duplicates in batch treated as hard
+                          negatives. Gradient impact is degenerate (identical doc vectors)
+                          but loss is technically inconsistent.
+        'masked'        - CE with same-sentence off-diagonal positions masked out of the
+                          denominator. Neither positive nor negative — excluded from loss.
+        'multi_positive'- Same multi-positive CE used for EEG-EEG. Same-sentence entries
+                          in batch marked as co-positives in the labels matrix.
     """
     if pooling_strategy == 'multi':
         batch_size = len(query_vectors)
@@ -28,7 +40,7 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         batch_size = query_vectors.size(0)
         device = query_vectors.device
 
-    # Compute similarities between queries and documents
+    # Compute similarities between queries and documents (diagonal)
     query_to_doc_sims = []
     for i in range(batch_size):
         if pooling_strategy == 'multi':
@@ -43,7 +55,7 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
 
     similarities = torch.stack(query_to_doc_sims)
 
-    # Create contrastive loss using in-batch negatives
+    # Build full batch similarity matrix (logits)
     logits = torch.zeros(batch_size, batch_size, device=device)
 
     for i in range(batch_size):
@@ -58,13 +70,12 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             sim = compute_similarity([query_i], [doc_j], pooling_strategy, temperature=1.0)
             logits[i, j] = sim[0] / temperature
 
-    # 🔍 DEBUG LOGGING - CRITICAL METRICS
+    # ── DEBUG LOGGING ────────────────────────────────────────────────────────
     if debug_step:
         print("\n" + "=" * 80)
         print("🔍 CONTRASTIVE LOSS DEBUG")
         print("=" * 80)
 
-        # Raw similarities (before temperature scaling)
         print(f"\n📊 RAW SIMILARITIES (temperature=1.0):")
         print(f"  Diagonal (positive pairs):  {torch.diagonal(logits * temperature).detach().cpu().numpy()}")
         print(f"  Min: {(logits * temperature).min().item():.4f}")
@@ -72,7 +83,6 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         print(f"  Mean: {(logits * temperature).mean().item():.4f}")
         print(f"  Std: {(logits * temperature).std().item():.4f}")
 
-        # Logits after temperature scaling
         print(f"\n🌡️  LOGITS (after dividing by temperature={temperature}):")
         print(f"  Diagonal (positive pairs):  {torch.diagonal(logits).detach().cpu().numpy()}")
         print(f"  Min: {logits.min().item():.4f}")
@@ -80,7 +90,6 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         print(f"  Mean: {logits.mean().item():.4f}")
         print(f"  Std: {logits.std().item():.4f}")
 
-        # Exponentials (this is where explosion happens!)
         exp_logits = torch.exp(logits)
         print(f"\n💥 EXPONENTIALS (exp(logits)):")
         print(f"  Diagonal (positive pairs):  {torch.diagonal(exp_logits).detach().cpu().numpy()}")
@@ -89,87 +98,144 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         print(f"  Mean: {exp_logits.mean().item():.2e}")
         print(f"  RANGE (max/min): {(exp_logits.max() / exp_logits.min()).item():.2e}")
 
-        # Check for numerical instability
         if exp_logits.max().item() > 1e10:
             print(f"  ⚠️  WARNING: Exponentials > 1e10 (numerical instability risk!)")
         if (exp_logits.max() / exp_logits.min()).item() > 1e8:
             print(f"  ⚠️  WARNING: Exponential range > 1e8 (gradient explosion risk!)")
 
-    # Multi-positive training: identify in-batch positives by sentence_id
-    if multi_positive_train and batch_metadata is not None:
-        # Extract sentence IDs and document type
-        sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
+    # ── DETERMINE DOCUMENT TYPE ───────────────────────────────────────────────
+    document_type = 'text'
+    if batch_metadata is not None:
         document_type = batch_metadata[0].get('document_type', 'text')
 
-        # Only apply multi-positive for EEG documents
-        if document_type == 'eeg':
-            # Create multi-positive labels matrix
-            labels_matrix = torch.zeros(batch_size, batch_size, device=device)
+    # ── EEG-EEG: MULTI-POSITIVE LOSS ─────────────────────────────────────────
+    if multi_positive_train and batch_metadata is not None and document_type == 'eeg':
+        sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
 
-            for i in range(batch_size):
-                for j in range(batch_size):
-                    # Mark as positive if same sentence_id
-                    if sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
-                        labels_matrix[i, j] = 1.0
+        labels_matrix = torch.zeros(batch_size, batch_size, device=device)
+        for i in range(batch_size):
+            for j in range(batch_size):
+                if sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
+                    labels_matrix[i, j] = 1.0
 
-            # 🔍 DEBUG: Multi-positive statistics
-            if debug_step:
-                print(f"\n🎯 MULTI-POSITIVE TRAINING:")
-                positives_per_query = labels_matrix.sum(dim=1)
-                print(f"  Positives per query: {positives_per_query.detach().cpu().numpy()}")
-                print(f"  Avg positives per query: {positives_per_query.mean().item():.2f}")
-                print(f"  Sentence IDs in batch: {set(sentence_ids)}")
+        if debug_step:
+            print(f"\n🎯 MULTI-POSITIVE TRAINING (EEG-EEG):")
+            positives_per_query = labels_matrix.sum(dim=1)
+            print(f"  Positives per query: {positives_per_query.detach().cpu().numpy()}")
+            print(f"  Avg positives per query: {positives_per_query.mean().item():.2f}")
+            print(f"  Sentence IDs in batch: {set(sentence_ids)}")
 
-            # Compute multi-positive contrastive loss
-            exp_logits = torch.exp(logits)
+        exp_logits = torch.exp(logits)
+        losses = []
+        for i in range(batch_size):
+            positive_mask = labels_matrix[i] > 0
+            num_positives = positive_mask.sum()
 
-            # For each query, compute loss
-            losses = []
-            for i in range(batch_size):
-                positive_mask = labels_matrix[i] > 0
-                num_positives = positive_mask.sum()
+            if num_positives > 0:
+                positive_sum = (exp_logits[i] * positive_mask).sum()
+                all_sum = exp_logits[i].sum()
+                loss_i = -torch.log(positive_sum / all_sum)
+                losses.append(loss_i)
 
-                if num_positives > 0:
-                    # Sum of similarities to all positives
-                    positive_sum = (exp_logits[i] * positive_mask).sum()
-                    # Sum of similarities to all samples
-                    all_sum = exp_logits[i].sum()
+                if debug_step:
+                    print(f"\n  Query {i}:")
+                    print(f"    Positives: {num_positives}")
+                    print(f"    Positive sum: {positive_sum.item():.2e}")
+                    print(f"    All sum: {all_sum.item():.2e}")
+                    print(f"    Ratio: {(positive_sum / all_sum).item():.4f}")
+                    print(f"    Loss: {loss_i.item():.4f}")
 
-                    # Multi-positive loss: -log(sum(pos) / sum(all))
-                    loss_i = -torch.log(positive_sum / all_sum)
-                    losses.append(loss_i)
-
-                    # 🔍 DEBUG: Per-query loss breakdown
-                    if debug_step:
-                        print(f"\n  Query {i}:")
-                        print(f"    Positives: {num_positives}")
-                        print(f"    Positive sum: {positive_sum.item():.2e}")
-                        print(f"    All sum: {all_sum.item():.2e}")
-                        print(f"    Ratio: {(positive_sum / all_sum).item():.4f}")
-                        print(f"    Loss: {loss_i.item():.4f}")
-
-            if losses:
-                loss = torch.stack(losses).mean()
-            else:
-                # Fallback to standard contrastive
-                labels = torch.arange(batch_size, device=device)
-                loss = F.cross_entropy(logits, labels)
+        if losses:
+            loss = torch.stack(losses).mean()
         else:
-            # For text documents, use standard contrastive
             labels = torch.arange(batch_size, device=device)
             loss = F.cross_entropy(logits, labels)
+
+    # ── EEG-TEXT: MASKED CE ───────────────────────────────────────────────────
+    elif document_type == 'text' and text_loss_mode == 'masked' and batch_metadata is not None:
+        sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
+
+        # inclusion_mask[i,j] = True  → include position j in row i's denominator
+        # inclusion_mask[i,j] = False → exclude (same sentence, off-diagonal)
+        inclusion_mask = torch.ones(batch_size, batch_size, dtype=torch.bool, device=device)
+        for i in range(batch_size):
+            for j in range(batch_size):
+                if i != j and sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
+                    inclusion_mask[i, j] = False
+
+        if debug_step:
+            masked_count = (~inclusion_mask).sum().item() - 0  # off-diagonal masks
+            print(f"\n🎭 MASKED CE (EEG-TEXT):")
+            print(f"  Sentence IDs in batch: {sentence_ids}")
+            print(f"  Off-diagonal positions masked: {(~inclusion_mask).sum().item()}")
+            print(f"  text_loss_mode: masked")
+
+        losses = []
+        for i in range(batch_size):
+            valid_mask = inclusion_mask[i]           # [batch_size] bool
+            valid_logits = logits[i][valid_mask]     # subset of logit row
+            positive_logit = logits[i, i]            # diagonal always included
+            loss_i = -positive_logit + torch.logsumexp(valid_logits, dim=0)
+            losses.append(loss_i)
+
+        loss = torch.stack(losses).mean()
+
+    # ── EEG-TEXT: MULTI-POSITIVE CE ───────────────────────────────────────────
+    elif document_type == 'text' and text_loss_mode == 'multi_positive' and batch_metadata is not None:
+        sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
+
+        labels_matrix = torch.zeros(batch_size, batch_size, device=device)
+        for i in range(batch_size):
+            for j in range(batch_size):
+                if sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
+                    labels_matrix[i, j] = 1.0
+
+        if debug_step:
+            print(f"\n🎯 MULTI-POSITIVE TRAINING (EEG-TEXT):")
+            positives_per_query = labels_matrix.sum(dim=1)
+            print(f"  Positives per query: {positives_per_query.detach().cpu().numpy()}")
+            print(f"  Avg positives per query: {positives_per_query.mean().item():.2f}")
+            print(f"  Sentence IDs in batch: {set(sentence_ids)}")
+
+        exp_logits = torch.exp(logits)
+        losses = []
+        for i in range(batch_size):
+            positive_mask = labels_matrix[i] > 0
+            num_positives = positive_mask.sum()
+
+            if num_positives > 0:
+                positive_sum = (exp_logits[i] * positive_mask).sum()
+                all_sum = exp_logits[i].sum()
+                loss_i = -torch.log(positive_sum / all_sum)
+                losses.append(loss_i)
+
+                if debug_step:
+                    print(f"\n  Query {i}:")
+                    print(f"    Positives: {num_positives}")
+                    print(f"    Positive sum: {positive_sum.item():.2e}")
+                    print(f"    All sum: {all_sum.item():.2e}")
+                    print(f"    Ratio: {(positive_sum / all_sum).item():.4f}")
+                    print(f"    Loss: {loss_i.item():.4f}")
+
+        if losses:
+            loss = torch.stack(losses).mean()
+        else:
+            labels = torch.arange(batch_size, device=device)
+            loss = F.cross_entropy(logits, labels)
+
+    # ── STANDARD CE (default for all other cases) ─────────────────────────────
     else:
-        # Standard single-positive contrastive loss
         labels = torch.arange(batch_size, device=device)
         loss = F.cross_entropy(logits, labels)
 
-        # 🔍 DEBUG: Standard contrastive loss
         if debug_step:
             print(f"\n🎯 STANDARD CONTRASTIVE LOSS:")
+            print(f"  document_type: {document_type}")
+            print(f"  text_loss_mode: {text_loss_mode}")
             print(f"  Labels: {labels.detach().cpu().numpy()}")
             print(f"  Loss: {loss.item():.4f}")
 
-    # 🔍 DEBUG: Final loss info
+    # ── FINAL DEBUG ───────────────────────────────────────────────────────────
     if debug_step:
         print(f"\n📉 FINAL LOSS:")
         print(f"  Value: {loss.item():.4f}")
@@ -177,6 +243,7 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         print("=" * 80 + "\n")
 
     return loss, similarities
+
 
 def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, document_type):
     """Compute alignment metrics between query and document representations"""
@@ -186,7 +253,6 @@ def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, docu
     else:
         batch_size = query_vectors.size(0)
 
-    # Query-to-doc similarities
     query_doc_sims = []
     for i in range(batch_size):
         if pooling_strategy == 'multi':
@@ -209,7 +275,8 @@ def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, docu
     return metrics
 
 
-def train_step(model, batch, optimizer, device, step_num, debug=False, multi_positive_train=False):
+def train_step(model, batch, optimizer, device, step_num, debug=False,
+               multi_positive_train=False, text_loss_mode='standard'):
     """Single training step WITH GRADIENT ANALYSIS"""
 
     # Move batch to device
@@ -221,7 +288,6 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
 
     document_type = batch['document_type']
 
-    # Enable debug logging every 50 steps or when explicitly debug=True
     debug_this_step = debug or (step_num % 50 == 0)
 
     if debug_this_step:
@@ -235,7 +301,9 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         else:
             print(f"  Doc text tokens: {batch['doc_text_tokens']['input_ids'].shape}")
         print(f"  Pooling strategy: {model.pooling_strategy}")
-        print(f"  Multi-positive training: {'ENABLED' if multi_positive_train else 'DISABLED'}")
+        print(f"  Multi-positive training (EEG-EEG): {'ENABLED' if multi_positive_train else 'DISABLED'}")
+        if document_type == 'text':
+            print(f"  Text loss mode: {text_loss_mode.upper()}")
 
     # Forward pass
     outputs = model(batch)
@@ -251,14 +319,15 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
             print(f"  Query vectors shape: {outputs['query_vectors'].shape}")
             print(f"  Doc vectors shape: {outputs['doc_vectors'].shape}")
 
-    # Compute contrastive loss with multi-positive support
+    # Compute contrastive loss
     loss, query_sims = compute_contrastive_loss(
         outputs['query_vectors'],
         outputs['doc_vectors'],
         model.pooling_strategy,
         batch_metadata=batch['metadata'],
         multi_positive_train=multi_positive_train,
-        debug_step=debug_this_step
+        debug_step=debug_this_step,
+        text_loss_mode=text_loss_mode
     )
 
     # Compute alignment metrics
@@ -269,7 +338,6 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         document_type
     )
 
-    # 🔍 DEBUG: Before backward pass
     if debug_this_step:
         print(f"\n⏪ BEFORE BACKWARD:")
         print(f"  Loss value: {loss.item():.4f}")
@@ -279,8 +347,6 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
     optimizer.zero_grad()
     loss.backward()
 
-    # 🔍 DEBUG: Gradient analysis BEFORE clipping
-    # 🔍 DEBUG: Gradient analysis BEFORE clipping
     if debug_this_step:
         print(f"\n🔬 GRADIENT ANALYSIS (before clipping):")
         total_norm = 0.0
@@ -297,7 +363,6 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
                 max_grad = max(max_grad, param_max)
                 min_grad = min(min_grad, param_min)
 
-                # Store for key layers
                 if 'eeg_encoder' in name or 'projection' in name:
                     grad_info[name] = {
                         'norm': param_norm,
@@ -311,7 +376,6 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
         print(f"  Max gradient value: {max_grad:.6f}")
         print(f"  Min gradient value: {min_grad:.6f}")
 
-        # FIX: Handle min_grad = 0 case
         if min_grad > 0:
             grad_range = max_grad / min_grad
             print(f"  Gradient range (max/min): {grad_range:.2e}")
@@ -319,17 +383,16 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
             print(f"  Gradient range (max/min): inf (some gradients are zero)")
 
         print(f"\n  Key layer gradients:")
-        for name, info in list(grad_info.items())[:5]:  # Show first 5
+        for name, info in list(grad_info.items())[:5]:
             print(f"    {name[:50]:50s} norm={info['norm']:.4f} max={info['max']:.6f}")
 
-        # Check for gradient issues
         if total_norm > 10.0:
             print(f"  ⚠️  WARNING: Large gradients detected (norm={total_norm:.2f})")
         if max_grad > 1.0:
             print(f"  ⚠️  WARNING: Gradient values > 1.0 (max={max_grad:.4f})")
-        if min_grad > 0 and (max_grad / min_grad) > 1e6:  # FIX: Check min_grad > 0 first
+        if min_grad > 0 and (max_grad / min_grad) > 1e6:
             print(f"  ⚠️  WARNING: Huge gradient range (may cause instability)")
-    # Clip gradients
+
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     if debug_this_step:
@@ -340,7 +403,6 @@ def train_step(model, batch, optimizer, device, step_num, debug=False, multi_pos
 
     optimizer.step()
 
-    # Log to wandb
     log_dict = {
         'train/loss': loss.item(),
         f'train/eeg_{document_type}_similarity': metrics[f'eeg_{document_type}_similarity'],
@@ -376,7 +438,6 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
 
     model.eval()
 
-    # Move batch to device
     if batch['doc_eegs'] is not None:
         batch['doc_eegs'] = batch['doc_eegs'].to(device)
     if batch['doc_text_tokens'] is not None:
@@ -384,7 +445,6 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
     batch['query_eegs'] = batch['query_eegs'].to(device)
 
     with torch.no_grad():
-        # Forward pass
         outputs = model(batch)
 
         print(f"\nTesting {len(temperatures)} different temperatures:")
@@ -393,7 +453,6 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
 
         results = []
         for temp in temperatures:
-            # Compute loss with this temperature
             loss, sims = compute_contrastive_loss(
                 outputs['query_vectors'],
                 outputs['doc_vectors'],
@@ -401,14 +460,13 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
                 temperature=temp,
                 batch_metadata=batch['metadata'],
                 multi_positive_train=False,
-                debug_step=False
+                debug_step=False,
+                text_loss_mode='standard'
             )
 
-            # Compute statistics
-            batch_size = len(outputs['query_vectors']) if isinstance(outputs['query_vectors'], list) else outputs[
-                'query_vectors'].size(0)
+            batch_size = len(outputs['query_vectors']) if isinstance(outputs['query_vectors'], list) else \
+                outputs['query_vectors'].size(0)
 
-            # Recompute logits to get statistics
             logits = torch.zeros(batch_size, batch_size, device=device)
             for i in range(batch_size):
                 for j in range(batch_size):
@@ -434,7 +492,6 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
                 'exp_range': exp_range
             })
 
-            # Color code based on stability
             stability = "✓" if exp_range < 1e6 and max_exp < 1e8 else "⚠️" if exp_range < 1e8 else "❌"
             print(
                 f"{temp:>12.3f} {loss.item():>10.4f} {max_logit:>12.2f} {max_exp:>15.2e} {exp_range:>15.2e} {stability}")
@@ -456,10 +513,10 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
     model.train()
     return results
 
-def validation_step(model, batch, device):
+
+def validation_step(model, batch, device, text_loss_mode='standard'):
     """Single validation step"""
 
-    # Move batch to device
     if batch['doc_eegs'] is not None:
         batch['doc_eegs'] = batch['doc_eegs'].to(device)
     if batch['doc_text_tokens'] is not None:
@@ -468,15 +525,17 @@ def validation_step(model, batch, device):
 
     document_type = batch['document_type']
 
-    # Forward pass (no gradients)
     with torch.no_grad():
         outputs = model(batch)
 
-        # Compute loss and metrics
         loss, query_sims = compute_contrastive_loss(
             outputs['query_vectors'],
             outputs['doc_vectors'],
-            model.pooling_strategy
+            model.pooling_strategy,
+            batch_metadata=batch['metadata'],
+            multi_positive_train=False,   # validation always uses single-positive diagonal
+            debug_step=False,
+            text_loss_mode=text_loss_mode
         )
 
         metrics = compute_alignment_metrics(
@@ -498,9 +557,9 @@ def build_document_database(dataloader, multi_positive_eval=False):
 
     print("Building document database for ranking evaluation...")
 
-    unique_docs = {}  # text/eeg_id -> doc_info
-    query_to_doc_mapping = {}  # query_idx -> unique_doc_idx (or list for multi-positive)
-    sentence_to_doc_indices = {}  # sentence_id -> [doc_indices] for multi-positive
+    unique_docs = {}
+    query_to_doc_mapping = {}
+    sentence_to_doc_indices = {}
     query_idx = 0
 
     for batch in dataloader:
@@ -518,7 +577,6 @@ def build_document_database(dataloader, multi_positive_eval=False):
                     'attention_mask': batch['doc_text_tokens']['attention_mask'][sample_idx].clone()
                 }
             else:  # eeg
-                # Use participant and sentence ID as key for EEG docs
                 doc_key = f"{metadata['doc_participant_id']}_{metadata['sentence_id']}"
                 doc_data = {
                     'eeg': batch['doc_eegs'][sample_idx].clone()
@@ -535,37 +593,34 @@ def build_document_database(dataloader, multi_positive_eval=False):
                     'participant_id': metadata.get('doc_participant_id', 'unknown')
                 }
 
-                # Track sentence to document mapping for multi-positive
                 if sentence_id not in sentence_to_doc_indices:
                     sentence_to_doc_indices[sentence_id] = []
                 sentence_to_doc_indices[sentence_id].append(unique_doc_idx)
             else:
                 unique_doc_idx = unique_docs[doc_key]['idx']
 
-            # For multi-positive: map query to all docs with same sentence_id
+            # Multi-positive eval: applies to EEG-EEG only
+            # For EEG-Text, text deduplicates to one doc per sentence so
+            # multi_positive_eval has no practical effect — single int mapping is correct.
             if multi_positive_eval and document_type == 'eeg':
-                # Will be populated later after all docs are collected
                 query_to_doc_mapping[query_idx] = {'sentence_id': sentence_id, 'primary_doc_idx': unique_doc_idx}
             else:
                 query_to_doc_mapping[query_idx] = unique_doc_idx
 
             query_idx += 1
 
-    # Convert to list for easier batch processing
     doc_list = [None] * len(unique_docs)
     for doc_key, doc_info in unique_docs.items():
         doc_list[doc_info['idx']] = doc_info
 
-    # For multi-positive: expand query_to_doc_mapping to include all relevant docs
     if multi_positive_eval:
         expanded_mapping = {}
         for q_idx, mapping_info in query_to_doc_mapping.items():
-            if isinstance(mapping_info, dict):  # multi-positive case
+            if isinstance(mapping_info, dict):
                 sentence_id = mapping_info['sentence_id']
-                # Get all doc indices for this sentence
                 relevant_doc_indices = sentence_to_doc_indices.get(sentence_id, [mapping_info['primary_doc_idx']])
                 expanded_mapping[q_idx] = relevant_doc_indices
-            else:  # single positive case (shouldn't happen but handle it)
+            else:
                 expanded_mapping[q_idx] = [mapping_info]
         query_to_doc_mapping = expanded_mapping
 
@@ -583,22 +638,18 @@ def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100,
 
     print(f"Generating consistent document subsets (subset_size={subset_size}, seed={seed})...")
 
-    # Set seed for reproducible subsets
     random.seed(seed)
 
-    query_subsets = {}  # query_idx -> list of doc_indices
+    query_subsets = {}
 
     for query_idx, correct_doc_info in query_to_doc_mapping.items():
-        # Handle multi-positive (list) vs single positive (int)
         if multi_positive_eval and isinstance(correct_doc_info, list):
             correct_doc_indices = correct_doc_info
         else:
             correct_doc_indices = [correct_doc_info] if isinstance(correct_doc_info, int) else correct_doc_info
 
-        # Always include all correct documents
         doc_subset_indices = correct_doc_indices.copy()
 
-        # Sample random negatives (excluding all correct docs)
         negative_candidates = [i for i in range(len(doc_list)) if i not in correct_doc_indices]
         if negative_candidates:
             num_negatives_needed = max(0, subset_size - len(correct_doc_indices))
@@ -637,52 +688,37 @@ def rank_documents_for_query(model, query_eeg, doc_list, doc_indices, device):
     model.eval()
 
     with torch.no_grad():
-        # Encode query
-        fake_batch = {
-            'query_eegs': query_eeg,
-            'doc_eegs': None,
-            'doc_text_tokens': None,
-            'document_type': 'dummy'  # Not used for query encoding
-        }
-
         if model.document_type == 'eeg':
             query_vectors = model.encode_eeg(query_eeg, is_document=False)
         else:
             query_vectors = model.encode_eeg(query_eeg, is_document=False)
 
-        # Handle different return types
         if isinstance(query_vectors, list):
-            query_vectors = query_vectors[0]  # Get first element for single query
+            query_vectors = query_vectors[0]
         else:
-            query_vectors = query_vectors[0:1]  # Keep as batch of 1
+            query_vectors = query_vectors[0:1]
 
-        # Encode all documents in subset
         doc_scores = []
 
         for doc_idx in doc_indices:
             doc_info = doc_list[doc_idx]
 
             if doc_info['type'] == 'text':
-                # Text document
                 input_ids = doc_info['data']['input_ids'].unsqueeze(0).to(device)
                 attention_mask = doc_info['data']['attention_mask'].unsqueeze(0).to(device)
                 doc_vectors = model.encode_text(input_ids, attention_mask)
             else:
-                # EEG document
                 doc_eeg = doc_info['data']['eeg'].unsqueeze(0).to(device)
                 doc_vectors = model.encode_eeg(doc_eeg, is_document=True)
 
-            # Handle different return types
             if isinstance(doc_vectors, list):
                 doc_vectors = doc_vectors[0]
             else:
                 doc_vectors = doc_vectors[0:1]
 
-            # Compute similarity
             sim = compute_similarity([query_vectors], [doc_vectors], model.pooling_strategy, temperature=1.0)
             doc_scores.append((doc_idx, sim[0].item()))
 
-    # Sort by score (descending)
     doc_scores.sort(key=lambda x: x[1], reverse=True)
     ranked_indices = [doc_idx for doc_idx, score in doc_scores]
     ranked_scores = [score for doc_idx, score in doc_scores]
@@ -701,13 +737,11 @@ def compute_ranking_metrics(ranked_doc_indices, correct_doc_indices, k_values=[1
 
     metrics = {}
 
-    # Ensure correct_doc_indices is a list
     if isinstance(correct_doc_indices, int):
         correct_doc_indices = [correct_doc_indices]
 
     num_relevant = len(correct_doc_indices)
 
-    # Find rank of first correct document (1-indexed)
     first_correct_rank = float('inf')
     for correct_idx in correct_doc_indices:
         try:
@@ -719,14 +753,11 @@ def compute_ranking_metrics(ranked_doc_indices, correct_doc_indices, k_values=[1
     if first_correct_rank == float('inf'):
         first_correct_rank = len(ranked_doc_indices) + 1
 
-    # Mean Reciprocal Rank (based on first correct doc)
     metrics['rr'] = 1.0 / first_correct_rank if first_correct_rank <= len(ranked_doc_indices) else 0.0
     metrics['rank_of_correct'] = first_correct_rank
 
-    # Hit@K, Precision@K, and Recall@K for all K values
     for k in k_values:
         if k <= len(ranked_doc_indices):
-            # Count how many relevant docs are in top-k
             top_k = ranked_doc_indices[:k]
             num_relevant_in_top_k = sum(1 for doc_idx in top_k if doc_idx in correct_doc_indices)
 
@@ -751,18 +782,19 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
     print(f"\n=== RANKING EVALUATION (Epoch {epoch_num}) ===")
     print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
 
-    doc_list, query_to_doc_mapping, sentence_to_doc_indices = build_document_database(dataloader, multi_positive_eval)
+    doc_list, query_to_doc_mapping, sentence_to_doc_indices = build_document_database(
+        dataloader, multi_positive_eval)
 
     if len(doc_list) == 0 or len(query_to_doc_mapping) == 0:
         print("Warning: No valid query-document pairs found for ranking evaluation")
         return {}
 
-    # Handle subset size
     if len(doc_list) < subset_size:
         print(f"Warning: Only {len(doc_list)} documents available, using all")
         subset_size = len(doc_list)
 
-    query_subsets = generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size, multi_positive_eval=multi_positive_eval)
+    query_subsets = generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size,
+                                                multi_positive_eval=multi_positive_eval)
     queries = collect_queries(dataloader, device)
 
     print(f"Ranking evaluation: {len(queries)} queries against {subset_size} documents each")
@@ -791,7 +823,6 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         print("Warning: No metrics computed")
         return {}
 
-    # Aggregate metrics
     ranking_metrics = {}
     metric_names = all_metrics[0].keys()
 
@@ -801,7 +832,6 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         if metric_name != 'rank_of_correct':
             ranking_metrics[f'ranking/{metric_name}_std'] = np.std(values)
 
-    # Add metadata
     ranking_metrics.update({
         'ranking/num_unique_documents': len(doc_list),
         'ranking/num_queries_evaluated': len(all_metrics),
@@ -811,7 +841,6 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         'ranking/multi_positive_eval': multi_positive_eval
     })
 
-    # Print summary
     print(f"Ranking Results (EEG-{model.document_type.upper()}):")
     if multi_positive_eval:
         print(f"  [Multi-Positive Mode] All recordings of same sentence treated as relevant")
@@ -822,7 +851,6 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
     print(f"  Hit@10: {ranking_metrics['ranking/hit_at_10']:.4f}")
     print(f"  Hit@20: {ranking_metrics['ranking/hit_at_20']:.4f}")
 
-    # Log to wandb
     wandb.log(ranking_metrics)
 
     return ranking_metrics
@@ -832,7 +860,8 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
 # MAIN TRAINING FUNCTIONS
 # ==========================================
 
-def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False, multi_positive_train=False):
+def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False,
+                multi_positive_train=False, text_loss_mode='standard'):
     """Train for a single epoch WITH PERIODIC DEBUGGING"""
 
     model.train()
@@ -843,27 +872,24 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
 
     document_type = None
 
-    # Run temperature sensitivity test at start of epoch 1
     if epoch_num == 1 and num_batches == 0:
         first_batch = next(iter(dataloader))
         print("\n🔬 Running temperature sensitivity analysis on first batch...")
         debug_temperature_sensitivity(model, first_batch, device)
 
     for batch_idx, batch in enumerate(dataloader):
-        # Debug first batch of first epoch with full detail
         debug_this_batch = debug and epoch_num == 1 and batch_idx == 0
 
-        # Calculate global step
         step_num = (epoch_num - 1) * len(dataloader) + batch_idx
 
-        # Get document type from batch
         if document_type is None:
             document_type = batch['document_type']
 
-        # Training step (with automatic debug logging every 50 steps)
         loss, metrics, grad_norm = train_step(
-            model, batch, optimizer, device, step_num, debug=debug_this_batch,
-            multi_positive_train=multi_positive_train
+            model, batch, optimizer, device, step_num,
+            debug=debug_this_batch,
+            multi_positive_train=multi_positive_train,
+            text_loss_mode=text_loss_mode
         )
 
         total_loss += loss
@@ -871,13 +897,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
         epoch_similarities.append(metrics[f'eeg_{document_type}_similarity'])
         epoch_grad_norms.append(grad_norm)
 
-        # Progress logging
         if batch_idx % 20 == 0:
             print(f"Epoch {epoch_num}/{total_epochs}, Batch {batch_idx + 1}/{len(dataloader)}, "
                   f"Loss: {loss:.4f}, EEG-{document_type.upper()} Sim: {metrics[f'eeg_{document_type}_similarity']:.4f}, "
                   f"Grad Norm: {grad_norm:.2f}")
 
-    # Compute epoch statistics
     avg_loss = total_loss / num_batches
     avg_similarity = np.mean(epoch_similarities)
     avg_grad_norm = np.mean(epoch_grad_norms)
@@ -895,7 +919,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
     return avg_loss, avg_similarity, avg_grad_norm
 
 
-def validate_epoch(model, val_dataloader, device, epoch_num):
+def validate_epoch(model, val_dataloader, device, epoch_num, text_loss_mode='standard'):
     """Validate for a single epoch"""
 
     model.eval()
@@ -906,21 +930,18 @@ def validate_epoch(model, val_dataloader, device, epoch_num):
     document_type = None
 
     for batch in val_dataloader:
-        # Get document type from batch
         if document_type is None:
             document_type = batch['document_type']
 
-        val_loss, val_metrics = validation_step(model, batch, device)
+        val_loss, val_metrics = validation_step(model, batch, device, text_loss_mode=text_loss_mode)
 
         total_val_loss += val_loss
         num_val_batches += 1
         val_similarities.append(val_metrics[f'eeg_{document_type}_similarity'])
 
-    # Compute validation statistics
     avg_val_loss = total_val_loss / num_val_batches
     avg_val_similarity = np.mean(val_similarities)
 
-    # Log validation metrics to wandb
     wandb.log({
         'val/loss': avg_val_loss,
         f'val/eeg_{document_type}_similarity': avg_val_similarity,
@@ -936,7 +957,6 @@ def validate_epoch(model, val_dataloader, device, epoch_num):
 def initialize_wandb(config):
     """Initialize wandb logging with dataset name and subject mode"""
 
-    # Extract config values
     dataset_name = config.get('dataset_name', 'Unknown')
     document_type = config.get('document_type', 'text')
     subject_mode = config.get('subject_mode', 'within-subject')
@@ -946,22 +966,24 @@ def initialize_wandb(config):
     version = config.get('version', 'v1')
     multi_positive_eval = config.get('multi_positive_eval', False)
     multi_positive_train = config.get('multi_positive_train', False)
+    text_loss_mode = config.get('text_loss_mode', 'standard')
 
-    # Create descriptive run name
     alignment_type = f"eeg_{document_type}"
     subject_mode_short = subject_mode.replace('-', '_')
     split_suffix = "_holdout" if holdout_subjects else "_random"
 
-    # Add multi-positive suffixes to run name
     mp_suffix = ""
     if multi_positive_eval:
         mp_suffix += "_MPeval"
     if multi_positive_train:
         mp_suffix += "_MPtrain"
+    # Only append text_loss_mode suffix when non-standard and using text documents
+    if document_type == 'text' and text_loss_mode != 'standard':
+        mp_suffix += f"_TLM{text_loss_mode}"
 
-    run_name = f"{dataset_name}_{alignment_type}_{subject_mode_short}_{pooling_strategy}_{eeg_arch}{split_suffix}{mp_suffix}"
+    run_name = (f"{dataset_name}_{alignment_type}_{subject_mode_short}_"
+                f"{pooling_strategy}_{eeg_arch}{split_suffix}{mp_suffix}")
 
-    # Tags
     tags = [
         'eeg-alignment',
         f'eeg-{document_type}',
@@ -973,22 +995,31 @@ def initialize_wandb(config):
         'holdout-subjects' if holdout_subjects else 'random-split'
     ]
 
-    # Add multi-positive tags
     if multi_positive_eval:
         tags.append('multi-positive-eval')
     if multi_positive_train:
         tags.append('multi-positive-train')
+    if document_type == 'text' and text_loss_mode != 'standard':
+        tags.append(f'text-loss-{text_loss_mode}')
+
+    # Determine loss type label for wandb config
+    if document_type == 'eeg' and multi_positive_train:
+        loss_type = 'multi_positive_contrastive'
+    elif document_type == 'text' and text_loss_mode == 'masked':
+        loss_type = 'masked_contrastive'
+    elif document_type == 'text' and text_loss_mode == 'multi_positive':
+        loss_type = 'multi_positive_contrastive'
+    else:
+        loss_type = 'contrastive'
 
     wandb.init(
         project="EEG-Alignment",
         name=run_name,
         config={
-            # Version and dataset info
             'version': version,
             'dataset_name': dataset_name,
             'dataset_path': config.get('dataset_path', 'unknown'),
 
-            # Experiment config
             'alignment_type': f'EEG-{document_type.upper()}',
             'document_type': document_type,
             'subject_mode': subject_mode,
@@ -996,21 +1027,19 @@ def initialize_wandb(config):
             'pooling_strategy': pooling_strategy,
             'holdout_subjects': holdout_subjects,
             'split_method': 'holdout_subjects' if holdout_subjects else 'random_samples',
-            'multi_positive_eval': multi_positive_eval,  # ADDED
-            'multi_positive_train': multi_positive_train,  # ADDED
+            'multi_positive_eval': multi_positive_eval,
+            'multi_positive_train': multi_positive_train,
+            'text_loss_mode': text_loss_mode,
 
-            # Model config
             'colbert_model_name': config.get('colbert_model_name', 'bert-base-uncased'),
             'eeg_arch': eeg_arch,
             'hidden_dim': config.get('hidden_dim', 768),
 
-            # Training config
             'batch_size': config.get('batch_size', 8),
             'learning_rate': config.get('learning_rate', 1e-4),
             'epochs': config.get('epochs', 50),
             'patience': config.get('patience', 10),
 
-            # Data config
             'max_text_len': config.get('max_text_len', 256),
             'max_eeg_len': config.get('max_eeg_len', 50),
             'train_samples': config.get('train_samples', 0),
@@ -1020,9 +1049,8 @@ def initialize_wandb(config):
             'val_subjects': config.get('val_subjects', 0),
             'test_subjects': config.get('test_subjects', 0),
 
-            # Experiment config
             'seed': config.get('seed', 42),
-            'loss_type': 'contrastive' if not multi_positive_train else 'multi_positive_contrastive',
+            'loss_type': loss_type,
             'similarity_function': f'{pooling_strategy}_similarity',
             'trainable_params': config.get('trainable_params', 0),
             'total_params': config.get('total_params', 0)
@@ -1033,12 +1061,20 @@ def initialize_wandb(config):
 
 def train_alignment_model(model, train_dataloader, val_dataloader, test_dataloader,
                           optimizer, num_epochs, patience=10, device='cuda',
-                          debug=False, config=None, multi_positive_eval=False, multi_positive_train=False):
+                          debug=False, config=None, multi_positive_eval=False,
+                          multi_positive_train=False, text_loss_mode='standard'):
     """
-    Complete training loop with validation and early stopping
+    Complete training loop with validation and early stopping.
+
+    Args:
+        text_loss_mode: Loss formulation for EEG-Text condition.
+            'standard'       - Standard CE (existing behaviour).
+            'masked'         - CE with same-sentence off-diagonal positions
+                               masked out of the softmax denominator.
+            'multi_positive' - Multi-positive CE matching EEG-EEG formulation.
+            Ignored when document_type is 'eeg'.
     """
 
-    # Initialize wandb
     if config:
         initialize_wandb(config)
 
@@ -1053,9 +1089,15 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Pooling strategy: {pooling_strategy}")
     print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
     print(f"Multi-positive training: {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
+    if document_type == 'text':
+        mode_labels = {
+            'standard': 'Standard CE (same-sentence treated as hard negative)',
+            'masked': 'Masked CE (same-sentence excluded from denominator)',
+            'multi_positive': 'Multi-positive CE (same-sentence treated as co-positives)'
+        }
+        print(f"Text loss mode: {text_loss_mode.upper()} → {mode_labels.get(text_loss_mode, text_loss_mode)}")
     print(f"Early stopping patience: {patience}")
 
-    # Early stopping variables
     best_val_loss = float('inf')
     best_val_similarity = 0.0
     epochs_without_improvement = 0
@@ -1066,7 +1108,6 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     for epoch in range(num_epochs):
         epoch_num = epoch + 1
 
-        # Training epoch
         train_loss, train_similarity, train_grad_norm = train_epoch(
             model=model,
             dataloader=train_dataloader,
@@ -1075,27 +1116,24 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             epoch_num=epoch_num,
             total_epochs=num_epochs,
             debug=debug,
-            multi_positive_train=multi_positive_train
+            multi_positive_train=multi_positive_train,
+            text_loss_mode=text_loss_mode
         )
 
-        # Validation epoch
         val_loss, val_similarity = validate_epoch(
             model=model,
             val_dataloader=val_dataloader,
             device=device,
-            epoch_num=epoch_num
+            epoch_num=epoch_num,
+            text_loss_mode=text_loss_mode
         )
 
-        # Early stopping logic - use loss as primary criterion
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_similarity = val_similarity
             best_epoch = epoch_num
             epochs_without_improvement = 0
-
-            # Save best model state
             best_model_state = model.state_dict().copy()
-
             print(f"New best validation loss: {best_val_loss:.4f} (epoch {epoch_num})")
         else:
             epochs_without_improvement += 1
@@ -1106,14 +1144,12 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
                 print(f"Best validation loss: {best_val_loss:.4f} (epoch {best_epoch})")
                 early_stopped = True
 
-        # Ranking evaluation every 3rd epoch
         if epoch_num % 3 == 0:
             ranking_metrics = perform_ranking_evaluation(
                 model, val_dataloader, device, epoch_num, subset_size=300,
                 multi_positive_eval=multi_positive_eval
             )
 
-        # Log epoch-level metrics
         wandb.log({
             'epoch/train_loss': train_loss,
             'epoch/val_loss': val_loss,
@@ -1125,7 +1161,6 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             'epoch/best_val_loss': best_val_loss
         })
 
-        # Print epoch summary
         print(f"\nEpoch {epoch_num}/{num_epochs} Summary:")
         print(f"  Train - Loss: {train_loss:.4f}, EEG-{document_type.upper()} Sim: {train_similarity:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, EEG-{document_type.upper()} Sim: {val_similarity:.4f}")
@@ -1136,19 +1171,16 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
         if early_stopped:
             break
 
-    # Restore best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"Restored best model from epoch {best_epoch}")
 
-    # Final test evaluation
     print(f"\n=== FINAL TEST EVALUATION ===")
     test_ranking_metrics = perform_ranking_evaluation(
         model, test_dataloader, device, epoch_num=-1, subset_size=300,
         multi_positive_eval=multi_positive_eval
     )
 
-    # Rename test metrics
     test_metrics = {}
     for key, value in test_ranking_metrics.items():
         if key.startswith('ranking/'):
@@ -1157,7 +1189,6 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
 
     wandb.log(test_metrics)
 
-    # Log training summary
     wandb.log({
         'training/completed_epochs': epoch_num,
         'training/early_stopped': early_stopped,
@@ -1171,6 +1202,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Subject mode: {subject_mode}")
     print(f"Multi-positive eval: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
     print(f"Multi-positive train: {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
+    if document_type == 'text':
+        print(f"Text loss mode: {text_loss_mode.upper()}")
     if early_stopped:
         print(f"Stopped early after {epoch_num} epochs")
     print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
@@ -1185,4 +1218,4 @@ def finish_wandb():
 
 # Import aliases for the controller
 train_simplified_model = train_alignment_model
-create_simplified_model = lambda **kwargs: None  # Placeholder - will be replaced by import
+create_simplified_model = lambda **kwargs: None  # Placeholder

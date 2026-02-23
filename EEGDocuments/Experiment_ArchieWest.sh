@@ -1,6 +1,10 @@
 #!/bin/bash
 #=================================================================
 # Job script for EEG-EEG Alignment with Nieuwland Dataset
+# Version: 2.1
+# New flag: --text_loss_mode {standard, masked, multi_positive}
+#   Only applies when --document_type text is used.
+#   Ignored for EEG-EEG runs.
 #=================================================================
 
 #SBATCH --export=ALL
@@ -16,7 +20,10 @@ module purge
 module load nvidia/sdk/23.3
 module load anaconda/python-3.9.7/2021.11
 
+# ─────────────────────────────────────────────────────────────────────────────
 # EEG-EEG ALIGNMENT: Match EEG queries to EEG document
+# --text_loss_mode is not used here (document_type=eeg)
+# ─────────────────────────────────────────────────────────────────────────────
 python controller.py \
     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     --dataset_type nieuwland \
@@ -35,5 +42,69 @@ python controller.py \
     --subject_mode cross-subject \
     --multi_positive_eval \
     --multi_positive_train
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EEG-TEXT (STANDARD): Baseline — same-sentence batch duplicates are hard negatives
+# ─────────────────────────────────────────────────────────────────────────────
+# python controller.py \
+#     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
+#     --dataset_type nieuwland \
+#     --document_type text \
+#     --pooling_strategy max \
+#     --eeg_arch transformer \
+#     --hidden_dim 768 \
+#     --lr 1e-4 \
+#     --weight_decay 0.01 \
+#     --dropout 0.2 \
+#     --patience 10 \
+#     --epochs 50 \
+#     --batch_size 64 \
+#     --max_eeg_len 50 \
+#     --seed 42 \
+#     --subject_mode cross-subject \
+#     --text_loss_mode standard
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EEG-TEXT (MASKED): Same-sentence batch duplicates excluded from CE denominator
+# ─────────────────────────────────────────────────────────────────────────────
+# python controller.py \
+#     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
+#     --dataset_type nieuwland \
+#     --document_type text \
+#     --pooling_strategy max \
+#     --eeg_arch transformer \
+#     --hidden_dim 768 \
+#     --lr 1e-4 \
+#     --weight_decay 0.01 \
+#     --dropout 0.2 \
+#     --patience 10 \
+#     --epochs 50 \
+#     --batch_size 64 \
+#     --max_eeg_len 50 \
+#     --seed 42 \
+#     --subject_mode cross-subject \
+#     --text_loss_mode masked
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EEG-TEXT (MULTI-POSITIVE): Same-sentence batch duplicates treated as co-positives
+# Mirrors the EEG-EEG multi-positive formulation exactly
+# ─────────────────────────────────────────────────────────────────────────────
+# python controller.py \
+#     --data_path /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
+#     --dataset_type nieuwland \
+#     --document_type text \
+#     --pooling_strategy max \
+#     --eeg_arch transformer \
+#     --hidden_dim 768 \
+#     --lr 1e-4 \
+#     --weight_decay 0.01 \
+#     --dropout 0.2 \
+#     --patience 10 \
+#     --epochs 50 \
+#     --batch_size 64 \
+#     --max_eeg_len 50 \
+#     --seed 42 \
+#     --subject_mode cross-subject \
+#     --text_loss_mode multi_positive
 
 /opt/software/scripts/job_epilogue.sh

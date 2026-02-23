@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Simplified Controller for EEG-EEG vs EEG-Text Alignment Experiments
-Version: 2.0
+Version: 2.1
 Focus: Compare within-subject vs cross-subject alignment
+New: text_loss_mode argument for EEG-Text loss formulation control
 """
 
 import torch
@@ -15,7 +16,6 @@ from transformers import AutoTokenizer
 import json
 from datetime import datetime
 
-# Import simplified modules
 from dataloader import SimplifiedEEGDataloader, simple_collate_fn, compute_global_eeg_dimensions
 from models import create_alignment_model
 from training import train_simplified_model, finish_wandb
@@ -73,12 +73,10 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
     print(f"Split strategy: {'holdout subjects' if holdout_subjects else 'random sample'}")
     print(f"Multi-positive evaluation: {'ENABLED' if multi_positive_eval else 'DISABLED'}")
 
-    # Compute global EEG dimensions if not provided
     if global_eeg_dims is None:
         global_eeg_dims = compute_global_eeg_dimensions(data_path, max_eeg_len, dataset_type)
         print(f"Computed global EEG dimensions: {global_eeg_dims}")
 
-    # Create datasets
     train_dataset = SimplifiedEEGDataloader(
         data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
         max_eeg_len=max_eeg_len, split='train', train_ratio=train_ratio,
@@ -103,7 +101,6 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
         document_type=document_type, subject_mode=subject_mode
     )
 
-    # Create dataloaders
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                   collate_fn=simple_collate_fn, num_workers=0,
                                   pin_memory=torch.cuda.is_available())
@@ -122,6 +119,7 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
 
     return train_dataloader, val_dataloader, test_dataloader, global_eeg_dims
 
+
 def inspect_dataset(data_path, dataset_type='auto'):
     """Inspect dataset structure and content"""
     print(f"\n=== DATASET INSPECTION ===")
@@ -130,15 +128,12 @@ def inspect_dataset(data_path, dataset_type='auto'):
     try:
         from dataloader import detect_dataset_format
 
-        # Detect format
         detected_format = detect_dataset_format(data_path) if dataset_type == 'auto' else dataset_type
         print(f"Dataset format: {detected_format}")
 
-        # Detect dataset name
         dataset_name = detect_dataset_name(data_path)
         print(f"Dataset name: {dataset_name}")
 
-        # Load dataset
         dataset = np.load(data_path, allow_pickle=True).item()
         ict_pairs = dataset.get('ict_pairs', [])
         metadata = dataset.get('metadata', {})
@@ -149,7 +144,6 @@ def inspect_dataset(data_path, dataset_type='auto'):
         if len(ict_pairs) > 0:
             sample_pair = ict_pairs[0]
 
-            # Check if we have both query_eeg and doc_eeg
             if hasattr(sample_pair, 'query_eeg') and hasattr(sample_pair, 'doc_eeg'):
                 print("✅ Dataset supports EEG-EEG alignment (has both query_eeg and doc_eeg)")
                 print(f"Sample query_eeg shape: {np.array(sample_pair.query_eeg).shape}")
@@ -161,9 +155,8 @@ def inspect_dataset(data_path, dataset_type='auto'):
             else:
                 print("⚠️ Dataset may not support EEG-EEG alignment (missing doc_eeg)")
 
-        # Basic statistics
         participants = set()
-        for pair in ict_pairs[:100]:  # Sample for speed
+        for pair in ict_pairs[:100]:
             if hasattr(pair, 'participant_id'):
                 participants.add(pair.participant_id)
             elif 'participant_id' in pair:
@@ -179,7 +172,6 @@ def save_experiment_config(config, output_dir):
     """Save experiment configuration to JSON file"""
     config_path = output_dir / "experiment_config.json"
 
-    # Convert non-serializable values
     serializable_config = {
         k: (v if isinstance(v, (str, int, float, bool, list, dict, type(None))) else str(v))
         for k, v in config.items()
@@ -187,6 +179,7 @@ def save_experiment_config(config, output_dir):
 
     with open(config_path, 'w') as f:
         json.dump(serializable_config, f, indent=2)
+
     print(f"Saved experiment config to: {config_path}")
 
 
@@ -211,9 +204,24 @@ def main():
 
     # Evaluation arguments
     parser.add_argument('--multi_positive_eval', action='store_true',
-                        help='Enable multi-positive evaluation: treat all recordings of same document as relevant (recommended for cross-subject)')
+                        help='Enable multi-positive evaluation: treat all recordings of same document as relevant '
+                             '(recommended for cross-subject EEG-EEG; no effect on EEG-Text eval)')
     parser.add_argument('--multi_positive_train', action='store_true',
-                        help='Enable multi-positive training: treat all in-batch recordings of same sentence as positives (recommended for cross-subject)')
+                        help='Enable multi-positive training for EEG-EEG: treat all in-batch recordings of same '
+                             'sentence as positives (recommended for cross-subject EEG-EEG)')
+
+    # Text loss mode argument
+    parser.add_argument('--text_loss_mode', default='standard',
+                        choices=['standard', 'masked', 'multi_positive'],
+                        help=(
+                            'Loss formulation for EEG-Text condition (ignored for EEG-EEG). '
+                            '"standard": CE where same-sentence batch duplicates are treated as hard negatives. '
+                            '"masked": CE where same-sentence off-diagonal positions are excluded from the '
+                            'softmax denominator (neither positive nor negative). '
+                            '"multi_positive": same multi-positive CE used for EEG-EEG, same-sentence batch '
+                            'entries treated as co-positives. '
+                            'Applies consistently to training, validation, and test evaluation.'
+                        ))
 
     # Model arguments
     parser.add_argument('--colbert_model_name', default='colbert-ir/colbertv2.0',
@@ -243,26 +251,28 @@ def main():
 
     args = parser.parse_args()
 
-    # Set random seeds
+    # Validate: text_loss_mode only meaningful for text documents
+    if args.document_type == 'eeg' and args.text_loss_mode != 'standard':
+        print(f"⚠️  Note: --text_loss_mode={args.text_loss_mode} has no effect when --document_type=eeg. "
+              f"EEG-EEG loss is controlled by --multi_positive_train.")
+
     set_seeds(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Detect dataset name
     dataset_name = detect_dataset_name(args.data_path)
     print(f"\n=== DATASET INFO ===")
     print(f"Dataset: {dataset_name}")
     print(f"Path: {args.data_path}")
 
-    # Inspect dataset
     if args.inspect_only:
         inspect_dataset(args.data_path, args.dataset_type)
         return
 
     inspect_dataset(args.data_path, args.dataset_type)
 
-    # Create output directory
-    output_dir = Path(args.output_dir) if args.output_dir else create_output_directory("simplified_eeg_alignment")
+    output_dir = Path(args.output_dir) if args.output_dir else create_output_directory(
+        "simplified_eeg_alignment")
     output_dir.mkdir(exist_ok=True)
 
     # Load tokenizer (only needed if using text documents)
@@ -309,7 +319,8 @@ def main():
         'alignment_task': f'EEG-{args.document_type.upper()}',
         'alignment_method': args.subject_mode,
         'multi_positive_eval': args.multi_positive_eval,
-        'multi_positive_train': args.multi_positive_train,  # NEW
+        'multi_positive_train': args.multi_positive_train,
+        'text_loss_mode': args.text_loss_mode,
 
         # Model config
         'colbert_model_name': args.colbert_model_name,
@@ -353,11 +364,21 @@ def main():
     print(f"Pooling Strategy: {args.pooling_strategy}")
     print(f"EEG Architecture: {args.eeg_arch}")
     print(f"Multi-Positive Eval: {'✅ ENABLED' if args.multi_positive_eval else '❌ DISABLED'}")
-    print(f"Multi-Positive Train: {'✅ ENABLED' if args.multi_positive_train else '❌ DISABLED'}")  # NEW
+    print(f"Multi-Positive Train: {'✅ ENABLED' if args.multi_positive_train else '❌ DISABLED'}")
+
+    if args.document_type == 'text':
+        mode_labels = {
+            'standard': 'Standard CE — same-sentence duplicates treated as hard negatives',
+            'masked': 'Masked CE — same-sentence duplicates excluded from softmax denominator',
+            'multi_positive': 'Multi-Positive CE — same-sentence duplicates treated as co-positives'
+        }
+        print(f"Text Loss Mode: {args.text_loss_mode.upper()} → {mode_labels.get(args.text_loss_mode)}")
+
     if args.multi_positive_eval and args.subject_mode == 'cross-subject':
         print(f"  → All recordings of same document will be treated as relevant in evaluation")
     if args.multi_positive_train and args.subject_mode == 'cross-subject':
         print(f"  → All in-batch recordings of same sentence will be treated as positives in training")
+
     print(f"Training samples: {config['train_samples']} ({train_subjects} subjects)")
     print(f"Validation samples: {config['val_samples']} ({val_subjects} subjects)")
     print(f"Test samples: {config['test_samples']} ({test_subjects} subjects)")
@@ -371,16 +392,14 @@ def main():
         hidden_dim=args.hidden_dim,
         eeg_arch=args.eeg_arch,
         pooling_strategy=args.pooling_strategy,
-        global_eeg_dims=global_eeg_dims,  # Pass this!
+        global_eeg_dims=global_eeg_dims,
         device=device,
         dropout=args.dropout
     )
 
-    # Update tokenizer vocab size if needed
     if tokenizer and args.document_type == 'text':
         model.set_tokenizer_vocab_size(len(tokenizer))
 
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model created! Total: {total_params:,}, Trainable: {trainable_params:,}")
@@ -397,7 +416,7 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=args.weight_decay,  # NEW: L2 regularization
+        weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
         eps=1e-8
     )
@@ -409,6 +428,8 @@ def main():
         print(f"Evaluation: Multi-positive labels enabled ✅")
     if args.multi_positive_train:
         print(f"Training: Multi-positive labels enabled ✅")
+    if args.document_type == 'text' and args.text_loss_mode != 'standard':
+        print(f"Text Loss Mode: {args.text_loss_mode.upper()} ✅")
 
     trained_model = train_simplified_model(
         model=model,
@@ -422,11 +443,16 @@ def main():
         debug=args.debug,
         config=config,
         multi_positive_eval=args.multi_positive_eval,
-        multi_positive_train=args.multi_positive_train  # NEW - Pass to training function
+        multi_positive_train=args.multi_positive_train,
+        text_loss_mode=args.text_loss_mode
     )
 
     # Save trained model
-    model_save_path = output_dir / f"simplified_model_{args.document_type}_{args.subject_mode}_{args.pooling_strategy}_{args.eeg_arch}.pt"
+    model_save_path = output_dir / (
+        f"simplified_model_{args.document_type}_{args.subject_mode}_"
+        f"{args.pooling_strategy}_{args.eeg_arch}"
+        f"{'_' + args.text_loss_mode if args.document_type == 'text' and args.text_loss_mode != 'standard' else ''}.pt"
+    )
     torch.save({
         'model_state_dict': trained_model.state_dict(),
         'config': config,
@@ -441,9 +467,9 @@ def main():
     print(f"Subject Mode: {args.subject_mode}")
     print(f"Multi-Positive Eval: {'ENABLED ✅' if args.multi_positive_eval else 'DISABLED ❌'}")
     print(f"Multi-Positive Train: {'ENABLED ✅' if args.multi_positive_train else 'DISABLED ❌'}")
+    if args.document_type == 'text':
+        print(f"Text Loss Mode: {args.text_loss_mode.upper()}")
     print(f"Results saved in: {output_dir}")
-
-
 
 
 if __name__ == "__main__":
