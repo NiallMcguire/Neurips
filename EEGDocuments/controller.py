@@ -223,6 +223,25 @@ def main():
                             'Applies consistently to training, validation, and test evaluation.'
                         ))
 
+    # Document encoder arguments
+    parser.add_argument('--doc_encoder_type', default='bert', choices=['bert', 'eeg'],
+                        help=(
+                            'Architecture for the document-side encoder. '
+                            '"bert": existing TextEncoder (BERT/ColBERT + LoRA) for text documents. '
+                            '"eeg": EEGEncoder architecture for text documents — token IDs are converted '
+                            'to vectors via frozen BERT token embeddings then passed through EEGEncoder. '
+                            'Only relevant when --document_type text. '
+                            'For --document_type eeg this flag has no effect.'
+                        ))
+    parser.add_argument('--freeze_doc_encoder', action='store_true',
+                        help=(
+                            'Freeze the document-side encoder weights after initialisation. '
+                            'For EEG-Text/bert: freezes TextEncoder (no LoRA gradients). '
+                            'For EEG-Text/eeg: freezes text_doc_eeg_encoder. '
+                            'For EEG-EEG: creates a separate frozen doc EEG encoder '
+                            '(query encoder remains trainable).'
+                        ))
+
     # Model arguments
     parser.add_argument('--colbert_model_name', default='colbert-ir/colbertv2.0',
                         help='ColBERT model name (for text encoding)')
@@ -321,6 +340,8 @@ def main():
         'multi_positive_eval': args.multi_positive_eval,
         'multi_positive_train': args.multi_positive_train,
         'text_loss_mode': args.text_loss_mode,
+        'doc_encoder_type': args.doc_encoder_type,
+        'freeze_doc_encoder': args.freeze_doc_encoder,
 
         # Model config
         'colbert_model_name': args.colbert_model_name,
@@ -373,6 +394,10 @@ def main():
             'multi_positive': 'Multi-Positive CE — same-sentence duplicates treated as co-positives'
         }
         print(f"Text Loss Mode: {args.text_loss_mode.upper()} → {mode_labels.get(args.text_loss_mode)}")
+        print(f"Doc Encoder Type: {args.doc_encoder_type.upper()}"
+              + (" (frozen)" if args.freeze_doc_encoder else " (trainable)"))
+    if args.document_type == 'eeg' and args.freeze_doc_encoder:
+        print(f"EEG Doc Encoder: FROZEN (separate from query encoder)")
 
     if args.multi_positive_eval and args.subject_mode == 'cross-subject':
         print(f"  → All recordings of same document will be treated as relevant in evaluation")
@@ -394,7 +419,9 @@ def main():
         pooling_strategy=args.pooling_strategy,
         global_eeg_dims=global_eeg_dims,
         device=device,
-        dropout=args.dropout
+        dropout=args.dropout,
+        doc_encoder_type=args.doc_encoder_type,
+        freeze_doc_encoder=args.freeze_doc_encoder
     )
 
     if tokenizer and args.document_type == 'text':
@@ -451,7 +478,9 @@ def main():
     model_save_path = output_dir / (
         f"simplified_model_{args.document_type}_{args.subject_mode}_"
         f"{args.pooling_strategy}_{args.eeg_arch}"
-        f"{'_' + args.text_loss_mode if args.document_type == 'text' and args.text_loss_mode != 'standard' else ''}.pt"
+        f"{'_' + args.text_loss_mode if args.document_type == 'text' and args.text_loss_mode != 'standard' else ''}"
+        f"_docenc{args.doc_encoder_type}"
+        f"{'_frozen' if args.freeze_doc_encoder else ''}.pt"
     )
     torch.save({
         'model_state_dict': trained_model.state_dict(),
@@ -469,6 +498,10 @@ def main():
     print(f"Multi-Positive Train: {'ENABLED ✅' if args.multi_positive_train else 'DISABLED ❌'}")
     if args.document_type == 'text':
         print(f"Text Loss Mode: {args.text_loss_mode.upper()}")
+        print(f"Doc Encoder Type: {args.doc_encoder_type.upper()}"
+              + (" (frozen)" if args.freeze_doc_encoder else " (trainable)"))
+    if args.document_type == 'eeg' and args.freeze_doc_encoder:
+        print(f"EEG Doc Encoder: FROZEN")
     print(f"Results saved in: {output_dir}")
 
 

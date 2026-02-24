@@ -599,11 +599,16 @@ def build_document_database(dataloader, multi_positive_eval=False):
             else:
                 unique_doc_idx = unique_docs[doc_key]['idx']
 
-            # Multi-positive eval: applies to EEG-EEG only
+            # Multi-positive eval: applies to EEG-EEG only.
             # For EEG-Text, text deduplicates to one doc per sentence so
             # multi_positive_eval has no practical effect — single int mapping is correct.
             if multi_positive_eval and document_type == 'eeg':
-                query_to_doc_mapping[query_idx] = {'sentence_id': sentence_id, 'primary_doc_idx': unique_doc_idx}
+                query_to_doc_mapping[query_idx] = {
+                    'sentence_id': sentence_id,
+                    'primary_doc_idx': unique_doc_idx,
+                    'query_participant_id': metadata.get('query_participant_id', 'unknown'),
+                    'subject_mode': metadata.get('subject_mode', 'within-subject')
+                }
             else:
                 query_to_doc_mapping[query_idx] = unique_doc_idx
 
@@ -615,19 +620,45 @@ def build_document_database(dataloader, multi_positive_eval=False):
 
     if multi_positive_eval:
         expanded_mapping = {}
+        own_doc_filtered_count = 0
+
         for q_idx, mapping_info in query_to_doc_mapping.items():
             if isinstance(mapping_info, dict):
                 sentence_id = mapping_info['sentence_id']
-                relevant_doc_indices = sentence_to_doc_indices.get(sentence_id, [mapping_info['primary_doc_idx']])
+                query_participant_id = mapping_info.get('query_participant_id', 'unknown')
+                subject_mode = mapping_info.get('subject_mode', 'within-subject')
+                all_doc_indices = sentence_to_doc_indices.get(sentence_id, [mapping_info['primary_doc_idx']])
+
+                if subject_mode == 'cross-subject':
+                    # In cross-subject eval, exclude the query subject's own EEG reading
+                    # from the positive set. The task is to retrieve OTHER subjects'
+                    # readings of the same sentence — not to recognise your own signal.
+                    relevant_doc_indices = [
+                        doc_idx for doc_idx in all_doc_indices
+                        if doc_list[doc_idx]['participant_id'] != query_participant_id
+                    ]
+                    own_doc_filtered_count += len(all_doc_indices) - len(relevant_doc_indices)
+
+                    if not relevant_doc_indices:
+                        # Should not happen in a well-formed cross-subject dataset,
+                        # but fall back to the paired doc to avoid a zero-positive query.
+                        relevant_doc_indices = [mapping_info['primary_doc_idx']]
+                else:
+                    # Within-subject: keep all docs for this sentence as positives.
+                    relevant_doc_indices = all_doc_indices
+
                 expanded_mapping[q_idx] = relevant_doc_indices
             else:
                 expanded_mapping[q_idx] = [mapping_info]
+
         query_to_doc_mapping = expanded_mapping
 
         print(f"Multi-positive evaluation enabled:")
         print(f"  Found {len(sentence_to_doc_indices)} unique sentences")
         avg_docs_per_sentence = np.mean([len(docs) for docs in sentence_to_doc_indices.values()])
         print(f"  Average documents per sentence: {avg_docs_per_sentence:.2f}")
+        if own_doc_filtered_count > 0:
+            print(f"  Cross-subject: filtered out {own_doc_filtered_count} own-subject doc(s) from positive sets")
 
     print(f"Found {len(doc_list)} unique documents for {len(query_to_doc_mapping)} queries")
     return doc_list, query_to_doc_mapping, sentence_to_doc_indices if multi_positive_eval else {}
@@ -967,6 +998,8 @@ def initialize_wandb(config):
     multi_positive_eval = config.get('multi_positive_eval', False)
     multi_positive_train = config.get('multi_positive_train', False)
     text_loss_mode = config.get('text_loss_mode', 'standard')
+    doc_encoder_type = config.get('doc_encoder_type', 'bert')
+    freeze_doc_encoder = config.get('freeze_doc_encoder', False)
 
     alignment_type = f"eeg_{document_type}"
     subject_mode_short = subject_mode.replace('-', '_')
@@ -980,6 +1013,10 @@ def initialize_wandb(config):
     # Only append text_loss_mode suffix when non-standard and using text documents
     if document_type == 'text' and text_loss_mode != 'standard':
         mp_suffix += f"_TLM{text_loss_mode}"
+    if doc_encoder_type != 'bert':
+        mp_suffix += f"_DE{doc_encoder_type}"
+    if freeze_doc_encoder:
+        mp_suffix += "_frozenDoc"
 
     run_name = (f"{dataset_name}_{alignment_type}_{subject_mode_short}_"
                 f"{pooling_strategy}_{eeg_arch}{split_suffix}{mp_suffix}")
@@ -1030,6 +1067,8 @@ def initialize_wandb(config):
             'multi_positive_eval': multi_positive_eval,
             'multi_positive_train': multi_positive_train,
             'text_loss_mode': text_loss_mode,
+            'doc_encoder_type': doc_encoder_type,
+            'freeze_doc_encoder': freeze_doc_encoder,
 
             'colbert_model_name': config.get('colbert_model_name', 'bert-base-uncased'),
             'eeg_arch': eeg_arch,
