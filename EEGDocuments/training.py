@@ -111,19 +111,35 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
     # ── EEG-EEG: MULTI-POSITIVE LOSS ─────────────────────────────────────────
     if multi_positive_train and batch_metadata is not None and document_type == 'eeg':
         sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
+        query_participant_ids = [meta.get('query_participant_id', 'unknown') for meta in batch_metadata]
+        doc_participant_ids = [meta.get('doc_participant_id', 'unknown') for meta in batch_metadata]
+        subject_mode = batch_metadata[0].get('subject_mode', 'within-subject')
 
+        # labels_matrix[i,j] = 1 if doc j is a valid positive for query i.
+        # inclusion_mask[i,j] = True if doc j should appear in query i's denominator.
+        #
+        # In cross-subject mode, any doc j whose participant matches query i's
+        # participant is excluded from BOTH — it is neither a positive nor a
+        # negative for query i, and does not contribute to the loss at all.
         labels_matrix = torch.zeros(batch_size, batch_size, device=device)
+        inclusion_mask = torch.ones(batch_size, batch_size, dtype=torch.bool, device=device)
+
         for i in range(batch_size):
             for j in range(batch_size):
-                if sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
+                if subject_mode == 'cross-subject' and doc_participant_ids[j] == query_participant_ids[i]:
+                    # Own-subject doc: completely invisible to this query.
+                    inclusion_mask[i, j] = False
+                elif sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
                     labels_matrix[i, j] = 1.0
 
         if debug_step:
-            print(f"\n🎯 MULTI-POSITIVE TRAINING (EEG-EEG):")
+            print(f"\n🎯 MULTI-POSITIVE TRAINING (EEG-EEG, {subject_mode}):")
             positives_per_query = labels_matrix.sum(dim=1)
-            print(f"  Positives per query: {positives_per_query.detach().cpu().numpy()}")
-            print(f"  Avg positives per query: {positives_per_query.mean().item():.2f}")
-            print(f"  Sentence IDs in batch: {set(sentence_ids)}")
+            excluded_per_query = (~inclusion_mask).sum(dim=1)
+            print(f"  Positives per query:        {positives_per_query.detach().cpu().numpy()}")
+            print(f"  Excluded (own-subj) per row: {excluded_per_query.detach().cpu().numpy()}")
+            print(f"  Avg positives per query:    {positives_per_query.mean().item():.2f}")
+            print(f"  Sentence IDs in batch:      {set(sentence_ids)}")
 
         exp_logits = torch.exp(logits)
         losses = []
@@ -133,17 +149,20 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
 
             if num_positives > 0:
                 positive_sum = (exp_logits[i] * positive_mask).sum()
-                all_sum = exp_logits[i].sum()
+                # Denominator only includes positions not masked out —
+                # own-subject docs are completely absent from this sum.
+                all_sum = (exp_logits[i] * inclusion_mask[i]).sum()
                 loss_i = -torch.log(positive_sum / all_sum)
                 losses.append(loss_i)
 
                 if debug_step:
                     print(f"\n  Query {i}:")
-                    print(f"    Positives: {num_positives}")
+                    print(f"    Positives:    {num_positives.item()}")
+                    print(f"    Excluded:     {(~inclusion_mask[i]).sum().item()}")
                     print(f"    Positive sum: {positive_sum.item():.2e}")
-                    print(f"    All sum: {all_sum.item():.2e}")
-                    print(f"    Ratio: {(positive_sum / all_sum).item():.4f}")
-                    print(f"    Loss: {loss_i.item():.4f}")
+                    print(f"    All sum:      {all_sum.item():.2e}")
+                    print(f"    Ratio:        {(positive_sum / all_sum).item():.4f}")
+                    print(f"    Loss:         {loss_i.item():.4f}")
 
         if losses:
             loss = torch.stack(losses).mean()
@@ -620,6 +639,7 @@ def build_document_database(dataloader, multi_positive_eval=False):
 
     if multi_positive_eval:
         expanded_mapping = {}
+        query_eval_metadata = {}  # q_idx -> {query_participant_id, subject_mode}
         own_doc_filtered_count = 0
 
         for q_idx, mapping_info in query_to_doc_mapping.items():
@@ -648,8 +668,16 @@ def build_document_database(dataloader, multi_positive_eval=False):
                     relevant_doc_indices = all_doc_indices
 
                 expanded_mapping[q_idx] = relevant_doc_indices
+                query_eval_metadata[q_idx] = {
+                    'query_participant_id': query_participant_id,
+                    'subject_mode': subject_mode
+                }
             else:
                 expanded_mapping[q_idx] = [mapping_info]
+                query_eval_metadata[q_idx] = {
+                    'query_participant_id': 'unknown',
+                    'subject_mode': 'within-subject'
+                }
 
         query_to_doc_mapping = expanded_mapping
 
@@ -659,17 +687,29 @@ def build_document_database(dataloader, multi_positive_eval=False):
         print(f"  Average documents per sentence: {avg_docs_per_sentence:.2f}")
         if own_doc_filtered_count > 0:
             print(f"  Cross-subject: filtered out {own_doc_filtered_count} own-subject doc(s) from positive sets")
+    else:
+        query_eval_metadata = {}
 
     print(f"Found {len(doc_list)} unique documents for {len(query_to_doc_mapping)} queries")
-    return doc_list, query_to_doc_mapping, sentence_to_doc_indices if multi_positive_eval else {}
+    return doc_list, query_to_doc_mapping, sentence_to_doc_indices if multi_positive_eval else {}, query_eval_metadata
 
 
-def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100, seed=42, multi_positive_eval=False):
-    """Generate consistent document subsets for fair ranking evaluation"""
+def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100, seed=42,
+                                multi_positive_eval=False, query_eval_metadata=None):
+    """Generate consistent document subsets for fair ranking evaluation.
+
+    In cross-subject mode the query subject's own EEG document is excluded from
+    BOTH the positive set (handled in build_document_database) AND the negative
+    candidate pool here. It must be completely invisible to that query — not
+    reclassified as a negative, simply absent from the pool entirely.
+    """
 
     print(f"Generating consistent document subsets (subset_size={subset_size}, seed={seed})...")
 
     random.seed(seed)
+
+    if query_eval_metadata is None:
+        query_eval_metadata = {}
 
     query_subsets = {}
 
@@ -681,7 +721,22 @@ def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100,
 
         doc_subset_indices = correct_doc_indices.copy()
 
-        negative_candidates = [i for i in range(len(doc_list)) if i not in correct_doc_indices]
+        # Retrieve per-query subject info so we can filter the negative pool.
+        meta = query_eval_metadata.get(query_idx, {})
+        query_participant_id = meta.get('query_participant_id', None)
+        subject_mode = meta.get('subject_mode', 'within-subject')
+
+        # In cross-subject mode, exclude the query subject's own doc from the
+        # negative pool entirely — it must not appear anywhere in the pool.
+        if subject_mode == 'cross-subject' and query_participant_id is not None:
+            negative_candidates = [
+                i for i in range(len(doc_list))
+                if i not in correct_doc_indices
+                and doc_list[i]['participant_id'] != query_participant_id
+            ]
+        else:
+            negative_candidates = [i for i in range(len(doc_list)) if i not in correct_doc_indices]
+
         if negative_candidates:
             num_negatives_needed = max(0, subset_size - len(correct_doc_indices))
             random_negatives = random.sample(negative_candidates,
@@ -813,7 +868,7 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
     print(f"\n=== RANKING EVALUATION (Epoch {epoch_num}) ===")
     print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
 
-    doc_list, query_to_doc_mapping, sentence_to_doc_indices = build_document_database(
+    doc_list, query_to_doc_mapping, sentence_to_doc_indices, query_eval_metadata = build_document_database(
         dataloader, multi_positive_eval)
 
     if len(doc_list) == 0 or len(query_to_doc_mapping) == 0:
@@ -825,7 +880,8 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
         subset_size = len(doc_list)
 
     query_subsets = generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size,
-                                                multi_positive_eval=multi_positive_eval)
+                                                multi_positive_eval=multi_positive_eval,
+                                                query_eval_metadata=query_eval_metadata)
     queries = collect_queries(dataloader, device)
 
     print(f"Ranking evaluation: {len(queries)} queries against {subset_size} documents each")
