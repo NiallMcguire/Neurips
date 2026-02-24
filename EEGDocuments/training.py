@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
 Training for EEG-EEG vs EEG-Text Alignment Experiments
-Version: 2.1
+Version: 2.2
 Focus: Track dataset name, subject mode, and model version
-New: text_loss_mode support ('standard', 'masked', 'multi_positive') for EEG-Text condition
+New (v2.1): text_loss_mode support ('standard', 'masked', 'multi_positive') for EEG-Text condition
+New (v2.2): weighted_multi_positive flag for EEG-EEG cross-subject training.
+            When enabled alongside multi_positive_train, each co-positive is weighted
+            by its cosine similarity to the query in raw (pre-encoder) EEG space.
+            Reliable positives (neurologically similar cross-subject pairs) contribute
+            more gradient; noisy positives are down-weighted automatically.
+            Has no effect unless document_type='eeg' and multi_positive_train=True.
 """
 
 import torch
@@ -11,13 +17,57 @@ import torch.nn.functional as F
 import wandb
 import numpy as np
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from models import compute_similarity
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Raw-space weight computation for weighted multi-positive
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_raw_eeg_weights(raw_query_eegs: torch.Tensor,
+                             raw_doc_eegs: torch.Tensor) -> torch.Tensor:
+    """
+    Compute pairwise cosine similarities in raw (pre-encoder) EEG space.
+
+    This is used to weight co-positives in the multi-positive contrastive loss.
+    Pairs whose raw EEG responses are more similar to the query receive higher
+    weight, giving the gradient more traction from reliable signal and less from
+    noisy cross-subject pairs.
+
+    Args:
+        raw_query_eegs: [batch, words, time, channels]  — batch of query EEGs
+        raw_doc_eegs:   [batch, words, time, channels]  — batch of doc EEGs
+
+    Returns:
+        weight_matrix: [batch, batch]  cosine similarities, clamped to [0, 1]
+                       weight_matrix[i, j] = raw similarity between query i and doc j
+    """
+    batch_size = raw_query_eegs.size(0)
+
+    # Flatten spatial/temporal dims → [batch, D]
+    q_flat = raw_query_eegs.view(batch_size, -1).float()
+    d_flat = raw_doc_eegs.view(batch_size, -1).float()
+
+    # L2-normalise
+    q_norm = F.normalize(q_flat, p=2, dim=1)   # [batch, D]
+    d_norm = F.normalize(d_flat, p=2, dim=1)   # [batch, D]
+
+    # Full pairwise cosine similarity matrix: [batch, batch]
+    weight_matrix = torch.matmul(q_norm, d_norm.t())
+
+    # Clamp negatives to zero — negative raw similarity = unreliable positive
+    weight_matrix = weight_matrix.clamp(min=0.0)
+
+    return weight_matrix
 
 
 def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
                              batch_metadata=None, multi_positive_train=False, debug_step=False,
-                             text_loss_mode='standard'):
+                             text_loss_mode='standard',
+                             weighted_multi_positive=False,
+                             raw_query_eegs: Optional[torch.Tensor] = None,
+                             raw_doc_eegs: Optional[torch.Tensor] = None):
     """
     Compute contrastive loss for EEG alignment using in-batch negatives.
 
@@ -32,6 +82,14 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
                           denominator. Neither positive nor negative — excluded from loss.
         'multi_positive'- Same multi-positive CE used for EEG-EEG. Same-sentence entries
                           in batch marked as co-positives in the labels matrix.
+
+    Args (new in v2.2):
+        weighted_multi_positive: If True, scale each co-positive's contribution in
+            the EEG-EEG multi-positive loss by its cosine similarity to the query
+            in raw (pre-encoder) EEG space.  Requires raw_query_eegs and raw_doc_eegs.
+            Has no effect unless multi_positive_train=True and document_type='eeg'.
+        raw_query_eegs: [batch, words, time, channels] — used for weight computation.
+        raw_doc_eegs:   [batch, words, time, channels] — used for weight computation.
     """
     if pooling_strategy == 'multi':
         batch_size = len(query_vectors)
@@ -115,31 +173,45 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
         doc_participant_ids = [meta.get('doc_participant_id', 'unknown') for meta in batch_metadata]
         subject_mode = batch_metadata[0].get('subject_mode', 'within-subject')
 
-        # labels_matrix[i,j] = 1 if doc j is a valid positive for query i.
-        # inclusion_mask[i,j] = True if doc j should appear in query i's denominator.
-        #
-        # In cross-subject mode, any doc j whose participant matches query i's
-        # participant is excluded from BOTH — it is neither a positive nor a
-        # negative for query i, and does not contribute to the loss at all.
         labels_matrix = torch.zeros(batch_size, batch_size, device=device)
         inclusion_mask = torch.ones(batch_size, batch_size, dtype=torch.bool, device=device)
 
         for i in range(batch_size):
             for j in range(batch_size):
                 if subject_mode == 'cross-subject' and doc_participant_ids[j] == query_participant_ids[i]:
-                    # Own-subject doc: completely invisible to this query.
                     inclusion_mask[i, j] = False
                 elif sentence_ids[i] == sentence_ids[j] and sentence_ids[i] != -1:
                     labels_matrix[i, j] = 1.0
+
+        # ── Raw-space weights for weighted multi-positive ─────────────────────
+        # weight_matrix[i,j] is the cosine similarity between raw query i and
+        # raw doc j.  Applied only within the positive set; denominator is unchanged.
+        use_weighted = (
+            weighted_multi_positive
+            and raw_query_eegs is not None
+            and raw_doc_eegs is not None
+        )
+
+        if use_weighted:
+            raw_weights = compute_raw_eeg_weights(
+                raw_query_eegs.to(device),
+                raw_doc_eegs.to(device)
+            )  # [batch, batch], values in [0, 1]
+        else:
+            raw_weights = None
 
         if debug_step:
             print(f"\n🎯 MULTI-POSITIVE TRAINING (EEG-EEG, {subject_mode}):")
             positives_per_query = labels_matrix.sum(dim=1)
             excluded_per_query = (~inclusion_mask).sum(dim=1)
-            print(f"  Positives per query:        {positives_per_query.detach().cpu().numpy()}")
+            print(f"  Positives per query:         {positives_per_query.detach().cpu().numpy()}")
             print(f"  Excluded (own-subj) per row: {excluded_per_query.detach().cpu().numpy()}")
-            print(f"  Avg positives per query:    {positives_per_query.mean().item():.2f}")
-            print(f"  Sentence IDs in batch:      {set(sentence_ids)}")
+            print(f"  Avg positives per query:     {positives_per_query.mean().item():.2f}")
+            print(f"  Sentence IDs in batch:       {set(sentence_ids)}")
+            print(f"  Weighted multi-positive:     {'✅ ON' if use_weighted else '❌ OFF'}")
+            if use_weighted and raw_weights is not None:
+                diag_weights = torch.diagonal(raw_weights * labels_matrix)
+                print(f"  Diagonal raw weights:        {diag_weights.detach().cpu().numpy()}")
 
         exp_logits = torch.exp(logits)
         losses = []
@@ -148,20 +220,42 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             num_positives = positive_mask.sum()
 
             if num_positives > 0:
-                positive_sum = (exp_logits[i] * positive_mask).sum()
-                # Denominator only includes positions not masked out —
-                # own-subject docs are completely absent from this sum.
-                all_sum = (exp_logits[i] * inclusion_mask[i]).sum()
-                loss_i = -torch.log(positive_sum / all_sum)
+                if use_weighted:
+                    # Per-positive weights, normalised to sum to 1 within this row's
+                    # positive set.  Prevents the total positive contribution from
+                    # varying with the number of positives in the batch.
+                    pos_weights = raw_weights[i] * positive_mask.float()
+                    weight_sum = pos_weights.sum()
+                    if weight_sum < 1e-8:
+                        # All positives have near-zero raw similarity — fall back
+                        # to uniform weighting so we don't divide by ~zero.
+                        pos_weights = positive_mask.float() / num_positives.float()
+                    else:
+                        pos_weights = pos_weights / weight_sum  # normalise to sum 1
+
+                    # Weighted positive numerator
+                    # sum_j[ w_ij * exp(logit_ij) ] / sum_j[ exp(logit_ij) * inclusion ]
+                    weighted_pos_sum = (exp_logits[i] * pos_weights).sum()
+                    all_sum = (exp_logits[i] * inclusion_mask[i]).sum()
+                    loss_i = -torch.log(weighted_pos_sum / all_sum + 1e-10)
+                else:
+                    # Standard (unweighted) multi-positive
+                    positive_sum = (exp_logits[i] * positive_mask).sum()
+                    all_sum = (exp_logits[i] * inclusion_mask[i]).sum()
+                    loss_i = -torch.log(positive_sum / all_sum)
+
                 losses.append(loss_i)
 
                 if debug_step:
                     print(f"\n  Query {i}:")
                     print(f"    Positives:    {num_positives.item()}")
                     print(f"    Excluded:     {(~inclusion_mask[i]).sum().item()}")
-                    print(f"    Positive sum: {positive_sum.item():.2e}")
+                    if use_weighted:
+                        print(f"    Pos weights:  {pos_weights[positive_mask].detach().cpu().numpy()}")
+                        print(f"    Wtd pos sum:  {weighted_pos_sum.item():.2e}")
+                    else:
+                        print(f"    Positive sum: {(exp_logits[i] * positive_mask).sum().item():.2e}")
                     print(f"    All sum:      {all_sum.item():.2e}")
-                    print(f"    Ratio:        {(positive_sum / all_sum).item():.4f}")
                     print(f"    Loss:         {loss_i.item():.4f}")
 
         if losses:
@@ -174,8 +268,6 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
     elif document_type == 'text' and text_loss_mode == 'masked' and batch_metadata is not None:
         sentence_ids = [meta.get('sentence_id', -1) for meta in batch_metadata]
 
-        # inclusion_mask[i,j] = True  → include position j in row i's denominator
-        # inclusion_mask[i,j] = False → exclude (same sentence, off-diagonal)
         inclusion_mask = torch.ones(batch_size, batch_size, dtype=torch.bool, device=device)
         for i in range(batch_size):
             for j in range(batch_size):
@@ -183,7 +275,6 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
                     inclusion_mask[i, j] = False
 
         if debug_step:
-            masked_count = (~inclusion_mask).sum().item() - 0  # off-diagonal masks
             print(f"\n🎭 MASKED CE (EEG-TEXT):")
             print(f"  Sentence IDs in batch: {sentence_ids}")
             print(f"  Off-diagonal positions masked: {(~inclusion_mask).sum().item()}")
@@ -191,9 +282,9 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
 
         losses = []
         for i in range(batch_size):
-            valid_mask = inclusion_mask[i]           # [batch_size] bool
-            valid_logits = logits[i][valid_mask]     # subset of logit row
-            positive_logit = logits[i, i]            # diagonal always included
+            valid_mask = inclusion_mask[i]
+            valid_logits = logits[i][valid_mask]
+            positive_logit = logits[i, i]
             loss_i = -positive_logit + torch.logsumexp(valid_logits, dim=0)
             losses.append(loss_i)
 
@@ -295,8 +386,16 @@ def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, docu
 
 
 def train_step(model, batch, optimizer, device, step_num, debug=False,
-               multi_positive_train=False, text_loss_mode='standard'):
-    """Single training step WITH GRADIENT ANALYSIS"""
+               multi_positive_train=False, text_loss_mode='standard',
+               weighted_multi_positive=False):
+    """
+    Single training step WITH GRADIENT ANALYSIS.
+
+    Args (new in v2.2):
+        weighted_multi_positive: Pass raw EEG tensors into the loss function for
+            co-positive weighting.  Only has an effect when multi_positive_train=True
+            and document_type='eeg'.
+    """
 
     # Move batch to device
     if batch['doc_eegs'] is not None:
@@ -321,6 +420,7 @@ def train_step(model, batch, optimizer, device, step_num, debug=False,
             print(f"  Doc text tokens: {batch['doc_text_tokens']['input_ids'].shape}")
         print(f"  Pooling strategy: {model.pooling_strategy}")
         print(f"  Multi-positive training (EEG-EEG): {'ENABLED' if multi_positive_train else 'DISABLED'}")
+        print(f"  Weighted multi-positive:           {'ENABLED ✅' if weighted_multi_positive else 'DISABLED ❌'}")
         if document_type == 'text':
             print(f"  Text loss mode: {text_loss_mode.upper()}")
 
@@ -338,6 +438,14 @@ def train_step(model, batch, optimizer, device, step_num, debug=False,
             print(f"  Query vectors shape: {outputs['query_vectors'].shape}")
             print(f"  Doc vectors shape: {outputs['doc_vectors'].shape}")
 
+    # Raw EEG tensors for weighted multi-positive weighting
+    # Only passed when the feature is active and doc EEGs are available
+    raw_query_eegs = None
+    raw_doc_eegs = None
+    if weighted_multi_positive and multi_positive_train and document_type == 'eeg':
+        raw_query_eegs = batch['query_eegs']   # already on device
+        raw_doc_eegs = batch['doc_eegs']        # already on device
+
     # Compute contrastive loss
     loss, query_sims = compute_contrastive_loss(
         outputs['query_vectors'],
@@ -346,7 +454,10 @@ def train_step(model, batch, optimizer, device, step_num, debug=False,
         batch_metadata=batch['metadata'],
         multi_positive_train=multi_positive_train,
         debug_step=debug_this_step,
-        text_loss_mode=text_loss_mode
+        text_loss_mode=text_loss_mode,
+        weighted_multi_positive=weighted_multi_positive,
+        raw_query_eegs=raw_query_eegs,
+        raw_doc_eegs=raw_doc_eegs
     )
 
     # Compute alignment metrics
@@ -618,9 +729,6 @@ def build_document_database(dataloader, multi_positive_eval=False):
             else:
                 unique_doc_idx = unique_docs[doc_key]['idx']
 
-            # Multi-positive eval: applies to EEG-EEG only.
-            # For EEG-Text, text deduplicates to one doc per sentence so
-            # multi_positive_eval has no practical effect — single int mapping is correct.
             if multi_positive_eval and document_type == 'eeg':
                 query_to_doc_mapping[query_idx] = {
                     'sentence_id': sentence_id,
@@ -639,7 +747,7 @@ def build_document_database(dataloader, multi_positive_eval=False):
 
     if multi_positive_eval:
         expanded_mapping = {}
-        query_eval_metadata = {}  # q_idx -> {query_participant_id, subject_mode}
+        query_eval_metadata = {}
         own_doc_filtered_count = 0
 
         for q_idx, mapping_info in query_to_doc_mapping.items():
@@ -650,9 +758,6 @@ def build_document_database(dataloader, multi_positive_eval=False):
                 all_doc_indices = sentence_to_doc_indices.get(sentence_id, [mapping_info['primary_doc_idx']])
 
                 if subject_mode == 'cross-subject':
-                    # In cross-subject eval, exclude the query subject's own EEG reading
-                    # from the positive set. The task is to retrieve OTHER subjects'
-                    # readings of the same sentence — not to recognise your own signal.
                     relevant_doc_indices = [
                         doc_idx for doc_idx in all_doc_indices
                         if doc_list[doc_idx]['participant_id'] != query_participant_id
@@ -660,11 +765,8 @@ def build_document_database(dataloader, multi_positive_eval=False):
                     own_doc_filtered_count += len(all_doc_indices) - len(relevant_doc_indices)
 
                     if not relevant_doc_indices:
-                        # Should not happen in a well-formed cross-subject dataset,
-                        # but fall back to the paired doc to avoid a zero-positive query.
                         relevant_doc_indices = [mapping_info['primary_doc_idx']]
                 else:
-                    # Within-subject: keep all docs for this sentence as positives.
                     relevant_doc_indices = all_doc_indices
 
                 expanded_mapping[q_idx] = relevant_doc_indices
@@ -696,13 +798,7 @@ def build_document_database(dataloader, multi_positive_eval=False):
 
 def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100, seed=42,
                                 multi_positive_eval=False, query_eval_metadata=None):
-    """Generate consistent document subsets for fair ranking evaluation.
-
-    In cross-subject mode the query subject's own EEG document is excluded from
-    BOTH the positive set (handled in build_document_database) AND the negative
-    candidate pool here. It must be completely invisible to that query — not
-    reclassified as a negative, simply absent from the pool entirely.
-    """
+    """Generate consistent document subsets for fair ranking evaluation."""
 
     print(f"Generating consistent document subsets (subset_size={subset_size}, seed={seed})...")
 
@@ -721,13 +817,10 @@ def generate_consistent_subsets(doc_list, query_to_doc_mapping, subset_size=100,
 
         doc_subset_indices = correct_doc_indices.copy()
 
-        # Retrieve per-query subject info so we can filter the negative pool.
         meta = query_eval_metadata.get(query_idx, {})
         query_participant_id = meta.get('query_participant_id', None)
         subject_mode = meta.get('subject_mode', 'within-subject')
 
-        # In cross-subject mode, exclude the query subject's own doc from the
-        # negative pool entirely — it must not appear anywhere in the pool.
         if subject_mode == 'cross-subject' and query_participant_id is not None:
             negative_candidates = [
                 i for i in range(len(doc_list))
@@ -948,7 +1041,8 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
 # ==========================================
 
 def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False,
-                multi_positive_train=False, text_loss_mode='standard'):
+                multi_positive_train=False, text_loss_mode='standard',
+                weighted_multi_positive=False):
     """Train for a single epoch WITH PERIODIC DEBUGGING"""
 
     model.train()
@@ -976,7 +1070,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
             model, batch, optimizer, device, step_num,
             debug=debug_this_batch,
             multi_positive_train=multi_positive_train,
-            text_loss_mode=text_loss_mode
+            text_loss_mode=text_loss_mode,
+            weighted_multi_positive=weighted_multi_positive
         )
 
         total_loss += loss
@@ -1056,6 +1151,8 @@ def initialize_wandb(config):
     text_loss_mode = config.get('text_loss_mode', 'standard')
     doc_encoder_type = config.get('doc_encoder_type', 'bert')
     freeze_doc_encoder = config.get('freeze_doc_encoder', False)
+    dynamic_resample = config.get('dynamic_resample', False)
+    weighted_multi_positive = config.get('weighted_multi_positive', False)
 
     alignment_type = f"eeg_{document_type}"
     subject_mode_short = subject_mode.replace('-', '_')
@@ -1066,7 +1163,10 @@ def initialize_wandb(config):
         mp_suffix += "_MPeval"
     if multi_positive_train:
         mp_suffix += "_MPtrain"
-    # Only append text_loss_mode suffix when non-standard and using text documents
+    if dynamic_resample:
+        mp_suffix += "_dynResample"
+    if weighted_multi_positive:
+        mp_suffix += "_wtdMP"
     if document_type == 'text' and text_loss_mode != 'standard':
         mp_suffix += f"_TLM{text_loss_mode}"
     if doc_encoder_type != 'bert':
@@ -1092,11 +1192,17 @@ def initialize_wandb(config):
         tags.append('multi-positive-eval')
     if multi_positive_train:
         tags.append('multi-positive-train')
+    if dynamic_resample:
+        tags.append('dynamic-resample')
+    if weighted_multi_positive:
+        tags.append('weighted-multi-positive')
     if document_type == 'text' and text_loss_mode != 'standard':
         tags.append(f'text-loss-{text_loss_mode}')
 
     # Determine loss type label for wandb config
-    if document_type == 'eeg' and multi_positive_train:
+    if document_type == 'eeg' and multi_positive_train and weighted_multi_positive:
+        loss_type = 'weighted_multi_positive_contrastive'
+    elif document_type == 'eeg' and multi_positive_train:
         loss_type = 'multi_positive_contrastive'
     elif document_type == 'text' and text_loss_mode == 'masked':
         loss_type = 'masked_contrastive'
@@ -1122,6 +1228,8 @@ def initialize_wandb(config):
             'split_method': 'holdout_subjects' if holdout_subjects else 'random_samples',
             'multi_positive_eval': multi_positive_eval,
             'multi_positive_train': multi_positive_train,
+            'dynamic_resample': dynamic_resample,
+            'weighted_multi_positive': weighted_multi_positive,
             'text_loss_mode': text_loss_mode,
             'doc_encoder_type': doc_encoder_type,
             'freeze_doc_encoder': freeze_doc_encoder,
@@ -1157,7 +1265,8 @@ def initialize_wandb(config):
 def train_alignment_model(model, train_dataloader, val_dataloader, test_dataloader,
                           optimizer, num_epochs, patience=10, device='cuda',
                           debug=False, config=None, multi_positive_eval=False,
-                          multi_positive_train=False, text_loss_mode='standard'):
+                          multi_positive_train=False, text_loss_mode='standard',
+                          weighted_multi_positive=False):
     """
     Complete training loop with validation and early stopping.
 
@@ -1168,6 +1277,9 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
                                masked out of the softmax denominator.
             'multi_positive' - Multi-positive CE matching EEG-EEG formulation.
             Ignored when document_type is 'eeg'.
+        weighted_multi_positive: Weight co-positives in the EEG-EEG multi-positive
+            loss by their raw-space cosine similarity to the query.
+            Only active when document_type='eeg' and multi_positive_train=True.
     """
 
     if config:
@@ -1177,13 +1289,16 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     pooling_strategy = model.pooling_strategy
     subject_mode = config.get('subject_mode', 'within-subject') if config else 'within-subject'
     dataset_name = config.get('dataset_name', 'Unknown') if config else 'Unknown'
+    dynamic_resample = config.get('dynamic_resample', False) if config else False
 
     print(f"Starting EEG-{document_type.upper()} alignment training...")
     print(f"Dataset: {dataset_name}")
     print(f"Subject mode: {subject_mode}")
     print(f"Pooling strategy: {pooling_strategy}")
-    print(f"Multi-positive evaluation: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
-    print(f"Multi-positive training: {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
+    print(f"Multi-positive evaluation:  {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
+    print(f"Multi-positive training:    {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
+    print(f"Weighted multi-positive:    {'ENABLED ✅' if weighted_multi_positive else 'DISABLED ❌'}")
+    print(f"Dynamic doc-subj resample:  {'ENABLED ✅' if dynamic_resample else 'DISABLED ❌'}")
     if document_type == 'text':
         mode_labels = {
             'standard': 'Standard CE (same-sentence treated as hard negative)',
@@ -1212,7 +1327,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             total_epochs=num_epochs,
             debug=debug,
             multi_positive_train=multi_positive_train,
-            text_loss_mode=text_loss_mode
+            text_loss_mode=text_loss_mode,
+            weighted_multi_positive=weighted_multi_positive
         )
 
         val_loss, val_similarity = validate_epoch(
@@ -1295,8 +1411,10 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"\nEEG-{document_type.upper()} alignment training completed!")
     print(f"Dataset: {dataset_name}")
     print(f"Subject mode: {subject_mode}")
-    print(f"Multi-positive eval: {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
-    print(f"Multi-positive train: {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
+    print(f"Multi-positive eval:        {'ENABLED ✅' if multi_positive_eval else 'DISABLED ❌'}")
+    print(f"Multi-positive train:       {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
+    print(f"Weighted multi-positive:    {'ENABLED ✅' if weighted_multi_positive else 'DISABLED ❌'}")
+    print(f"Dynamic doc-subj resample:  {'ENABLED ✅' if dynamic_resample else 'DISABLED ❌'}")
     if document_type == 'text':
         print(f"Text loss mode: {text_loss_mode.upper()}")
     if early_stopped:
@@ -1304,11 +1422,6 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
 
     return model
-
-
-def finish_wandb():
-    """Finish wandb run"""
-    wandb.finish()
 
 
 # Import aliases for the controller

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Simplified Dataloader for EEG-EEG vs EEG-Text Alignment
-Version: 2.0
+Version: 2.1
 Focus: Support within-subject and cross-subject pairing
+New (v2.1): dynamic_resample flag for cross-subject EEG-EEG — re-samples the
+            document subject on every __getitem__ call rather than locking it
+            in at preprocessing time.  Only active when:
+              document_type='eeg' AND subject_mode='cross-subject' AND dynamic_resample=True
 """
 
 import numpy as np
@@ -116,7 +120,7 @@ def compute_global_eeg_dimensions(data_path, max_eeg_len=50, dataset_type='auto'
 class SimplifiedEEGDataloader(Dataset):
     """
     Simplified Dataset for EEG-EEG vs EEG-Text alignment experiments
-    Version: 2.0
+    Version: 2.1
 
     Key features:
     - Always uses query_eeg as query
@@ -124,6 +128,13 @@ class SimplifiedEEGDataloader(Dataset):
     - Supports within-subject and cross-subject pairing
     - No masking complexity
     - Simple train/val/test splits
+
+    v2.1 additions:
+    - dynamic_resample: When True (and document_type='eeg', subject_mode='cross-subject'),
+      re-samples the document subject on every __getitem__ call instead of fixing it at
+      preprocessing time.  This exposes the model to the full positive distribution across
+      training and prevents memorisation of a single query→doc subject pairing per sentence.
+      Has no effect for within-subject or EEG-Text experiments.
     """
 
     def __init__(self, data_path: str, tokenizer=None, max_text_len: int = 256,
@@ -131,11 +142,15 @@ class SimplifiedEEGDataloader(Dataset):
                  split: str = 'train', normalize_eeg: bool = True,
                  debug: bool = False, global_eeg_dims: tuple = None,
                  dataset_type: str = 'auto', holdout_subjects: bool = False,
-                 document_type: str = 'text', subject_mode: str = 'within-subject'):
+                 document_type: str = 'text', subject_mode: str = 'within-subject',
+                 dynamic_resample: bool = False):
         """
         Args:
-            document_type: 'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
-            subject_mode: 'within-subject' (same person) or 'cross-subject' (different people)
+            document_type:    'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
+            subject_mode:     'within-subject' (same person) or 'cross-subject' (different people)
+            dynamic_resample: Re-sample the doc subject on every __getitem__ call.
+                              Only active when document_type='eeg' AND subject_mode='cross-subject'.
+                              When False (default), the doc subject is fixed at preprocessing time.
         """
 
         self.tokenizer = tokenizer
@@ -146,6 +161,13 @@ class SimplifiedEEGDataloader(Dataset):
         self.holdout_subjects = holdout_subjects
         self.document_type = document_type
         self.subject_mode = subject_mode
+        self.dynamic_resample = dynamic_resample and (document_type == 'eeg') and (subject_mode == 'cross-subject')
+
+        if dynamic_resample and not self.dynamic_resample:
+            print("⚠️  dynamic_resample=True has no effect: only active for EEG-EEG cross-subject mode.")
+
+        if self.dynamic_resample:
+            print("✅ Dynamic doc-subject resampling ENABLED (cross-subject EEG-EEG)")
 
         # Set global EEG dimensions
         if global_eeg_dims is not None:
@@ -205,12 +227,13 @@ class SimplifiedEEGDataloader(Dataset):
 
         self.pairs = [self.ict_pairs[i] for i in self.indices]
 
-        # 🔥 NEW: Compute per-subject statistics for normalization
+        # Compute per-subject statistics for normalization
         print(f"Computing per-subject EEG statistics for normalization...")
         self.subject_stats = self._compute_subject_statistics()
         print(f"  Computed stats for {len(self.subject_stats)} subjects")
 
-        # For cross-subject mode, build sentence-to-subject mapping
+        # For cross-subject mode, build sentence-to-subject mapping.
+        # Required for both static and dynamic resampling.
         if subject_mode == 'cross-subject' and document_type == 'eeg':
             self._build_sentence_subject_mapping()
 
@@ -235,18 +258,18 @@ class SimplifiedEEGDataloader(Dataset):
         for pair in self.pairs:
             participant_id = pair.get('participant_id', 'unknown')
 
-            # Collect query EEG - DON'T convert to numpy yet!
+            # Collect query EEG
             query_eeg = pair.get('query_eeg', None)
             if query_eeg is not None:
                 if participant_id not in subject_eegs:
                     subject_eegs[participant_id] = []
-                subject_eegs[participant_id].append(query_eeg)  # FIX: Removed np.array conversion
+                subject_eegs[participant_id].append(query_eeg)
 
             # Collect doc EEG if available (for EEG-EEG alignment)
             if self.document_type == 'eeg':
                 doc_eeg = pair.get('doc_eeg', None)
                 if doc_eeg is not None:
-                    subject_eegs[participant_id].append(doc_eeg)  # FIX: Removed np.array conversion
+                    subject_eegs[participant_id].append(doc_eeg)
 
         # Compute statistics per subject
         subject_stats = {}
@@ -254,26 +277,21 @@ class SimplifiedEEGDataloader(Dataset):
             if len(eeg_list) == 0:
                 continue
 
-            # Concatenate all EEG data for this subject
             try:
-                # Flatten all dimensions - now we convert to numpy
                 all_values = []
                 for eeg in eeg_list:
-                    eeg_array = np.array(eeg, dtype=np.float32)  # Convert HERE instead
+                    eeg_array = np.array(eeg, dtype=np.float32)
                     if len(eeg_array.shape) >= 2:
-                        # Flatten to get all channel values
                         all_values.append(eeg_array.reshape(-1))
 
                 if all_values:
                     combined = np.concatenate(all_values)
-                    # Remove zeros (padding)
                     non_zero = combined[combined != 0]
 
                     if len(non_zero) > 0:
                         subject_mean = np.mean(non_zero)
                         subject_std = np.std(non_zero)
 
-                        # Avoid division by zero
                         if subject_std < 1e-6:
                             subject_std = 1.0
 
@@ -314,7 +332,6 @@ class SimplifiedEEGDataloader(Dataset):
 
     def _create_subject_split(self, split, train_ratio, debug):
         """Create subject-based train/val/test split"""
-        # Extract all unique participants
         participant_to_indices = {}
         for idx, pair in enumerate(self.ict_pairs):
             participant_id = pair.get('participant_id', 'unknown')
@@ -328,7 +345,6 @@ class SimplifiedEEGDataloader(Dataset):
         if debug:
             print(f"Found {len(unique_participants)} unique participants")
 
-        # Split participants: 80% train, 10% val, 10% test
         n_participants = len(unique_participants)
         train_end = int(n_participants * 0.8)
         val_end = int(n_participants * 0.9)
@@ -342,7 +358,6 @@ class SimplifiedEEGDataloader(Dataset):
         else:
             raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
 
-        # Collect all indices for selected participants
         selected_indices = []
         for participant in selected_participants:
             selected_indices.extend(participant_to_indices[participant])
@@ -359,24 +374,19 @@ class SimplifiedEEGDataloader(Dataset):
         random.shuffle(shuffled_indices)
 
         if split in ['train', 'val']:
-            # Standard 2-way split during training
             split_idx = int(len(self.ict_pairs) * train_ratio)
             if split == 'train':
                 selected_indices = shuffled_indices[:split_idx]
             else:  # val
                 selected_indices = shuffled_indices[split_idx:]
         elif split == 'test':
-            # 3-way split: use validation portion and split it further
             val_start_idx = int(len(self.ict_pairs) * train_ratio)
             val_indices = shuffled_indices[val_start_idx:]
-
-            # Split remaining data: 50% val, 50% test
             val_split_point = len(val_indices) // 2
-            selected_indices = val_indices[val_split_point:]  # Second half for test
+            selected_indices = val_indices[val_split_point:]
         else:
             raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
 
-        # Count unique subjects in this split
         unique_subjects = set()
         for idx in selected_indices:
             participant_id = self.ict_pairs[idx].get('participant_id', 'unknown')
@@ -413,7 +423,6 @@ class SimplifiedEEGDataloader(Dataset):
         if query_eeg is None:
             return None
 
-        # Process query EEG
         query_eeg_processed = self._process_eeg(query_eeg)
         if query_eeg_processed is None:
             return None
@@ -422,7 +431,6 @@ class SimplifiedEEGDataloader(Dataset):
         if self.document_type == 'eeg':
             # EEG-EEG alignment
             if self.subject_mode == 'within-subject':
-                # Within-subject: use doc_eeg from same participant
                 doc_eeg = pair.get('doc_eeg', None)
                 if doc_eeg is None:
                     return None
@@ -435,17 +443,17 @@ class SimplifiedEEGDataloader(Dataset):
                 doc_participant_id = pair.get('participant_id', 'unknown')
 
             else:  # cross-subject
-                # Cross-subject: find doc_eeg from different participant, same sentence
                 sentence_id = pair.get('sentence_id', 0)
                 query_participant_id = pair.get('participant_id', 'unknown')
 
-                # Find other participants who read the same sentence
+                # Validate that at least one other subject exists for this sentence.
+                # If dynamic_resample is True, the actual doc selection happens in
+                # __getitem__; we still need a valid static fallback here.
                 if sentence_id in self.sentence_to_subjects:
                     other_participants = [p for p in self.sentence_to_subjects[sentence_id].keys()
                                           if p != query_participant_id]
 
                     if other_participants:
-                        # Randomly select a different participant
                         doc_participant_id = random.choice(other_participants)
                         doc_pair_indices = self.sentence_to_subjects[sentence_id][doc_participant_id]
                         doc_pair_idx = random.choice(doc_pair_indices)
@@ -461,16 +469,14 @@ class SimplifiedEEGDataloader(Dataset):
 
                         doc_data = doc_eeg_processed
                     else:
-                        # No other participants for this sentence, skip
+                        # No other participants for this sentence — skip
                         return None
                 else:
-                    # Sentence not in mapping, skip
                     return None
 
             doc_text = None
 
         else:  # document_type == 'text'
-            # EEG-Text alignment: use doc_text (subject_mode doesn't apply)
             doc_text = pair.get('doc_text', '').strip()
             if not doc_text:
                 return None
@@ -478,7 +484,6 @@ class SimplifiedEEGDataloader(Dataset):
             doc_data = None
             doc_participant_id = pair.get('participant_id', 'unknown')
 
-        # Extract query text for reference
         query_text = pair.get('query_text', '').strip()
 
         return {
@@ -500,7 +505,6 @@ class SimplifiedEEGDataloader(Dataset):
             eeg_array = np.array(eeg_data, dtype=np.float32)
 
             if len(eeg_array.shape) == 3:
-                # 3D format: [num_words, time_samples, channels]
                 num_words, time_samples, channels = eeg_array.shape
                 if num_words > self.max_eeg_len:
                     eeg_array = eeg_array[:self.max_eeg_len]
@@ -512,7 +516,6 @@ class SimplifiedEEGDataloader(Dataset):
                 return padded_eeg
 
             elif len(eeg_array.shape) == 2:
-                # 2D format: [time_samples, channels]
                 time_samples, channels = eeg_array.shape
                 padded_eeg = np.zeros((self.global_max_words, self.global_max_time, self.global_max_channels),
                                       dtype=np.float32)
@@ -520,7 +523,6 @@ class SimplifiedEEGDataloader(Dataset):
                 return padded_eeg
 
             else:
-                # Try to reshape flattened data
                 flattened = eeg_array.flatten()
                 for channels in [32, 63, 64, 128, 256]:
                     if len(flattened) % channels == 0:
@@ -550,26 +552,21 @@ class SimplifiedEEGDataloader(Dataset):
         if not self.normalize_eeg:
             return eeg_tensor
 
-        # Use subject-specific normalization if available
         if participant_id in self.subject_stats:
             stats = self.subject_stats[participant_id]
             subject_mean = stats['mean']
             subject_std = stats['std']
-
-            # Apply subject-wise z-score normalization
             normalized = (eeg_tensor - subject_mean) / subject_std
             return normalized
         else:
             # Fallback to global normalization if subject stats not available
             if len(eeg_tensor.shape) == 3:
-                # Get all non-zero values (simpler approach - no complex masking)
                 non_zero_values = eeg_tensor[eeg_tensor != 0]
 
                 if non_zero_values.numel() > 0:
                     mean = torch.mean(non_zero_values)
                     std = torch.std(non_zero_values)
 
-                    # Avoid division by zero
                     if std < 1e-6:
                         std = torch.tensor(1.0, device=eeg_tensor.device)
 
@@ -615,18 +612,58 @@ class SimplifiedEEGDataloader(Dataset):
         return len(self.processed_pairs)
 
     def __getitem__(self, idx):
-        """Get sample for training with subject-wise normalization"""
+        """
+        Get sample for training with subject-wise normalization.
+
+        When dynamic_resample=True (cross-subject EEG-EEG only), a new document
+        subject is sampled on every call.  This prevents the model from memorising
+        a fixed query→doc subject pairing per sentence and forces it to learn
+        subject-invariant semantic representations.
+        """
         sample = self.processed_pairs[idx]
 
-        # Process query EEG (always present) with subject-specific normalization
+        # ── Query EEG ──────────────────────────────────────────────────────────
         query_eeg_tensor = torch.tensor(sample['query_eeg'], dtype=torch.float32)
         query_eeg_tensor = self._normalize_eeg(query_eeg_tensor, sample['query_participant_id'])
 
-        # Process document based on type
+        # ── Document ───────────────────────────────────────────────────────────
         if self.document_type == 'eeg':
-            # EEG-EEG alignment with subject-specific normalization
-            doc_eeg_tensor = torch.tensor(sample['doc_eeg'], dtype=torch.float32)
-            doc_eeg_tensor = self._normalize_eeg(doc_eeg_tensor, sample['doc_participant_id'])
+
+            # ── Dynamic resampling path ────────────────────────────────────────
+            if self.dynamic_resample:
+                sentence_id = sample['sentence_id']
+                query_pid = sample['query_participant_id']
+                other_pids = [p for p in self.sentence_to_subjects[sentence_id].keys()
+                              if p != query_pid]
+
+                doc_eeg_tensor = None
+                doc_pid = sample['doc_participant_id']  # fallback
+
+                if other_pids:
+                    # Pick a fresh random subject and a random pair from that subject
+                    sampled_pid = random.choice(other_pids)
+                    pair_indices = self.sentence_to_subjects[sentence_id][sampled_pid]
+                    raw_pair = self.pairs[random.choice(pair_indices)]
+                    raw_doc_eeg = raw_pair.get('doc_eeg', None)
+
+                    if raw_doc_eeg is not None:
+                        processed = self._process_eeg(raw_doc_eeg)
+                        if processed is not None:
+                            doc_eeg_tensor = torch.tensor(processed, dtype=torch.float32)
+                            doc_eeg_tensor = self._normalize_eeg(doc_eeg_tensor, sampled_pid)
+                            doc_pid = sampled_pid
+
+                # Fallback: use the statically-processed doc from preprocessing
+                if doc_eeg_tensor is None:
+                    doc_eeg_tensor = torch.tensor(sample['doc_eeg'], dtype=torch.float32)
+                    doc_eeg_tensor = self._normalize_eeg(doc_eeg_tensor, sample['doc_participant_id'])
+                    doc_pid = sample['doc_participant_id']
+
+            # ── Static path (original behaviour) ──────────────────────────────
+            else:
+                doc_eeg_tensor = torch.tensor(sample['doc_eeg'], dtype=torch.float32)
+                doc_eeg_tensor = self._normalize_eeg(doc_eeg_tensor, sample['doc_participant_id'])
+                doc_pid = sample['doc_participant_id']
 
             return {
                 'query_eeg': query_eeg_tensor,
@@ -634,17 +671,17 @@ class SimplifiedEEGDataloader(Dataset):
                 'doc_text_tokens': None,
                 'metadata': {
                     'query_participant_id': sample['query_participant_id'],
-                    'doc_participant_id': sample['doc_participant_id'],
+                    'doc_participant_id': doc_pid,
                     'sentence_id': sample['sentence_id'],
                     'document_type': sample['document_type'],
                     'subject_mode': sample['subject_mode'],
                     'query_text': sample['query_text'],
-                    'original_idx': sample['original_idx']
+                    'original_idx': sample['original_idx'],
+                    'dynamic_resampled': self.dynamic_resample
                 }
             }
 
         else:  # document_type == 'text'
-            # EEG-Text alignment
             doc_tokens = self._tokenize_text(sample['doc_text'])
 
             return {
@@ -659,7 +696,8 @@ class SimplifiedEEGDataloader(Dataset):
                     'subject_mode': sample['subject_mode'],
                     'query_text': sample['query_text'],
                     'doc_text': sample['doc_text'],
-                    'original_idx': sample['original_idx']
+                    'original_idx': sample['original_idx'],
+                    'dynamic_resampled': False
                 }
             }
 
@@ -667,19 +705,15 @@ class SimplifiedEEGDataloader(Dataset):
 def simple_collate_fn(batch):
     """Simple collate function for batching"""
 
-    # Determine document type from first sample
     document_type = batch[0]['metadata']['document_type']
 
-    # Stack query EEGs (always present)
     query_eegs = torch.stack([item['query_eeg'] for item in batch])
 
     if document_type == 'eeg':
-        # EEG-EEG alignment
         doc_eegs = torch.stack([item['doc_eeg'] for item in batch])
         doc_text_tokens = None
 
     else:  # document_type == 'text'
-        # EEG-Text alignment
         doc_eegs = None
         doc_text_tokens = {
             'input_ids': torch.stack([item['doc_text_tokens']['input_ids'] for item in batch]),
@@ -715,7 +749,9 @@ def debug_batch(batch, print_details=True):
             query_subjects = [m['query_participant_id'] for m in batch['metadata']]
             doc_subjects = [m['doc_participant_id'] for m in batch['metadata']]
             cross_pairs = sum(1 for q, d in zip(query_subjects, doc_subjects) if q != d)
+            dynamic_flag = batch['metadata'][0].get('dynamic_resampled', False)
             print(f"  Cross-subject pairs: {cross_pairs}/{batch_size}")
+            print(f"  Dynamic resampling: {'✅ ON' if dynamic_flag else '❌ OFF'}")
     else:
         print(f"  Doc text input_ids: {batch['doc_text_tokens']['input_ids'].shape}")
         print(f"  Doc text attention_mask: {batch['doc_text_tokens']['attention_mask'].shape}")
