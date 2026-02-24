@@ -604,7 +604,7 @@ def compute_single_vector_similarity(query_vectors, doc_vectors, temperature=1.0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Factory
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def create_alignment_model(document_type='text', colbert_model_name='bert-base-uncased',
                            hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
