@@ -1427,3 +1427,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
 # Import aliases for the controller
 train_simplified_model = train_alignment_model
 create_simplified_model = lambda **kwargs: None  # Placeholder
+
+
+def finish_wandb():
+    """Finish the current wandb run. Called by controller.py after training completes."""
+    wandb.finish()
