@@ -36,7 +36,7 @@ python controller.py \
     --pooling_strategy max \
     --eeg_arch transformer \
     --hidden_dim 768 \
-    --lr 1e-4 \
+    --lr 5e-5 \
     --weight_decay 0.01 \
     --dropout 0.2 \
     --patience 10 \
