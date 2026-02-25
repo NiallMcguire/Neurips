@@ -27,7 +27,7 @@ python controller.py \
     --hidden_dim 768 \
     --lr 5e-5 \
     --weight_decay 0.01 \
-    --dropout 0.2 \
+    --dropout 0.3 \
     --patience 10 \
     --epochs 50 \
     --batch_size 64 \
