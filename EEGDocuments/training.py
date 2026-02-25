@@ -644,8 +644,15 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
     return results
 
 
-def validation_step(model, batch, device, text_loss_mode='standard'):
-    """Single validation step"""
+def validation_step(model, batch, device, text_loss_mode='standard', multi_positive_train=False):
+    """Single validation step.
+
+    multi_positive_train must match the training flag.  When True, validation
+    uses the same multi-positive CE as training so that val/loss is a valid
+    signal.  When False (default), standard diagonal CE is used — which will
+    produce a spuriously increasing val/loss whenever the model correctly learns
+    to cluster co-positive EEGs together.
+    """
 
     if batch['doc_eegs'] is not None:
         batch['doc_eegs'] = batch['doc_eegs'].to(device)
@@ -663,7 +670,7 @@ def validation_step(model, batch, device, text_loss_mode='standard'):
             outputs['doc_vectors'],
             model.pooling_strategy,
             batch_metadata=batch['metadata'],
-            multi_positive_train=False,   # validation always uses single-positive diagonal
+            multi_positive_train=multi_positive_train,
             debug_step=False,
             text_loss_mode=text_loss_mode
         )
@@ -1101,8 +1108,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
     return avg_loss, avg_similarity, avg_grad_norm
 
 
-def validate_epoch(model, val_dataloader, device, epoch_num, text_loss_mode='standard'):
-    """Validate for a single epoch"""
+def validate_epoch(model, val_dataloader, device, epoch_num, text_loss_mode='standard',
+                   multi_positive_train=False):
+    """Validate for a single epoch.
+
+    multi_positive_train must match the training flag so that val/loss is
+    computed with the same objective as train/loss.
+    """
 
     model.eval()
     total_val_loss = 0
@@ -1115,7 +1127,11 @@ def validate_epoch(model, val_dataloader, device, epoch_num, text_loss_mode='sta
         if document_type is None:
             document_type = batch['document_type']
 
-        val_loss, val_metrics = validation_step(model, batch, device, text_loss_mode=text_loss_mode)
+        val_loss, val_metrics = validation_step(
+            model, batch, device,
+            text_loss_mode=text_loss_mode,
+            multi_positive_train=multi_positive_train
+        )
 
         total_val_loss += val_loss
         num_val_batches += 1
@@ -1309,7 +1325,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Early stopping patience: {patience}")
 
     best_val_loss = float('inf')
-    best_val_similarity = 0.0
+    best_val_similarity = -1.0          # higher is better — used for early stopping
     epochs_without_improvement = 0
     best_model_state = None
     best_epoch = 0
@@ -1336,23 +1352,31 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             val_dataloader=val_dataloader,
             device=device,
             epoch_num=epoch_num,
-            text_loss_mode=text_loss_mode
+            text_loss_mode=text_loss_mode,
+            multi_positive_train=multi_positive_train
         )
 
-        if val_loss < best_val_loss:
+        # Early stopping on val_similarity (higher = better).
+        # Similarity is computed on the diagonal independently of the loss
+        # formulation, making it a robust signal for both standard and
+        # multi-positive training.  val_loss is still logged for diagnostics.
+        if val_similarity > best_val_similarity:
             best_val_loss = val_loss
             best_val_similarity = val_similarity
             best_epoch = epoch_num
             epochs_without_improvement = 0
             best_model_state = model.state_dict().copy()
-            print(f"New best validation loss: {best_val_loss:.4f} (epoch {epoch_num})")
+            print(f"New best val similarity: {best_val_similarity:.4f} "
+                  f"(loss: {best_val_loss:.4f}, epoch {epoch_num})")
         else:
             epochs_without_improvement += 1
-            print(f"No improvement for {epochs_without_improvement}/{patience} epochs")
+            print(f"No improvement for {epochs_without_improvement}/{patience} epochs "
+                  f"(best sim: {best_val_similarity:.4f} @ epoch {best_epoch})")
 
             if epochs_without_improvement >= patience:
                 print(f"Early stopping triggered after {epoch_num} epochs!")
-                print(f"Best validation loss: {best_val_loss:.4f} (epoch {best_epoch})")
+                print(f"Best val similarity: {best_val_similarity:.4f} "
+                      f"(loss: {best_val_loss:.4f}, epoch {best_epoch})")
                 early_stopped = True
 
         if epoch_num % 3 == 0:
@@ -1369,13 +1393,14 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             'epoch/learning_rate': optimizer.param_groups[0]['lr'],
             'epoch/epoch_num': epoch_num,
             'epoch/epochs_without_improvement': epochs_without_improvement,
-            'epoch/best_val_loss': best_val_loss
+            'epoch/best_val_loss': best_val_loss,
+            'epoch/best_val_similarity': best_val_similarity
         })
 
         print(f"\nEpoch {epoch_num}/{num_epochs} Summary:")
         print(f"  Train - Loss: {train_loss:.4f}, EEG-{document_type.upper()} Sim: {train_similarity:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, EEG-{document_type.upper()} Sim: {val_similarity:.4f}")
-        print(f"  Best  - Val Loss: {best_val_loss:.4f} (epoch {best_epoch})")
+        print(f"  Best  - Val Sim: {best_val_similarity:.4f} / Val Loss: {best_val_loss:.4f} (epoch {best_epoch})")
         print(f"  Early Stopping: {epochs_without_improvement}/{patience} epochs without improvement")
         print("-" * 70)
 
@@ -1404,6 +1429,7 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
         'training/completed_epochs': epoch_num,
         'training/early_stopped': early_stopped,
         'training/best_epoch': best_epoch,
+        'training/best_val_similarity': best_val_similarity,
         'training/best_val_loss': best_val_loss,
         'training/final_val_loss': val_loss
     })
@@ -1419,7 +1445,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
         print(f"Text loss mode: {text_loss_mode.upper()}")
     if early_stopped:
         print(f"Stopped early after {epoch_num} epochs")
-    print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+    print(f"Best val similarity: {best_val_similarity:.4f} "
+          f"(loss: {best_val_loss:.4f}) at epoch {best_epoch}")
 
     return model
 
