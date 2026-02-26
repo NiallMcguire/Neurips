@@ -215,6 +215,10 @@ class SimplifiedEEGDataloader(Dataset):
             print(f"Document type: {document_type} ({'EEG-EEG' if document_type == 'eeg' else 'EEG-Text'} alignment)")
             print(f"Subject mode: {subject_mode}")
 
+        # Keep a reference to all pairs (pre-filter) so that doc_subject
+        # sentences can be looked up even after query_subject filtering.
+        self.all_ict_pairs = self.ict_pairs
+
         # ── Fixed two-subject filtering ────────────────────────────────────────
         # When query_subject is specified, restrict the dataset to pairs where
         # the query comes from that subject only.  This enables clean two-subject
@@ -251,8 +255,10 @@ class SimplifiedEEGDataloader(Dataset):
             if self.debug:
                 print("✅ Dataset supports EEG-EEG alignment")
 
-        # For cross-subject mode, we need multiple subjects
-        if subject_mode == 'cross-subject' and document_type == 'eeg':
+        # For cross-subject mode, we need multiple subjects —
+        # UNLESS doc_subject is explicitly fixed (two-subject experiment),
+        # in which case the doc subject comes from outside the filtered set.
+        if subject_mode == 'cross-subject' and document_type == 'eeg' and self.doc_subject is None:
             unique_subjects = set(pair['participant_id'] for pair in self.ict_pairs)
             if len(unique_subjects) < 2:
                 raise ValueError(f"Cross-subject mode requires at least 2 subjects, found {len(unique_subjects)}")
@@ -383,25 +389,48 @@ class SimplifiedEEGDataloader(Dataset):
         return subject_stats
 
     def _build_sentence_subject_mapping(self):
-        """Build mapping of sentences to subjects for cross-subject pairing"""
+        """Build mapping of sentences to subjects for cross-subject pairing.
+
+        When doc_subject is fixed (two-subject experiment), the query pairs
+        contain only one subject so we must index the doc subject from the
+        full unfiltered pair list (self.all_ict_pairs).
+        """
         self.sentence_to_subjects = {}  # sentence_id -> {participant_id: [pair_indices]}
 
-        for idx, pair in enumerate(self.pairs):
-            sentence_id = pair.get('sentence_id', 0)
-            participant_id = pair.get('participant_id', 'unknown')
+        if self.doc_subject is not None:
+            # Two-subject mode: index doc_subject from all_ict_pairs.
+            # Values are indices into all_ict_pairs, not self.pairs.
+            # _process_single_pair will use self.all_ict_pairs for lookups.
+            for idx, pair in enumerate(self.all_ict_pairs):
+                pid = pair.get('participant_id', 'unknown')
+                if pid != self.doc_subject:
+                    continue
+                sentence_id = pair.get('sentence_id', 0)
+                if sentence_id not in self.sentence_to_subjects:
+                    self.sentence_to_subjects[sentence_id] = {}
+                self.sentence_to_subjects[sentence_id].setdefault(self.doc_subject, []).append(idx)
 
-            if sentence_id not in self.sentence_to_subjects:
-                self.sentence_to_subjects[sentence_id] = {}
+            if self.debug:
+                print(f"Built doc-subject sentence mapping for '{self.doc_subject}': "
+                      f"{len(self.sentence_to_subjects)} sentences")
+        else:
+            # Standard mode: index all subjects from self.pairs
+            for idx, pair in enumerate(self.pairs):
+                sentence_id = pair.get('sentence_id', 0)
+                participant_id = pair.get('participant_id', 'unknown')
 
-            if participant_id not in self.sentence_to_subjects[sentence_id]:
-                self.sentence_to_subjects[sentence_id][participant_id] = []
+                if sentence_id not in self.sentence_to_subjects:
+                    self.sentence_to_subjects[sentence_id] = {}
 
-            self.sentence_to_subjects[sentence_id][participant_id].append(idx)
+                if participant_id not in self.sentence_to_subjects[sentence_id]:
+                    self.sentence_to_subjects[sentence_id][participant_id] = []
 
-        if self.debug:
-            print(f"Built sentence-subject mapping: {len(self.sentence_to_subjects)} unique sentences")
-            multi_subject_sentences = sum(1 for s in self.sentence_to_subjects.values() if len(s) > 1)
-            print(f"  Sentences with multiple subjects: {multi_subject_sentences}")
+                self.sentence_to_subjects[sentence_id][participant_id].append(idx)
+
+            if self.debug:
+                print(f"Built sentence-subject mapping: {len(self.sentence_to_subjects)} unique sentences")
+                multi_subject_sentences = sum(1 for s in self.sentence_to_subjects.values() if len(s) > 1)
+                print(f"  Sentences with multiple subjects: {multi_subject_sentences}")
 
     def _create_subject_split(self, split, train_ratio, debug):
         """Create subject-based train/val/test split"""
@@ -535,7 +564,13 @@ class SimplifiedEEGDataloader(Dataset):
                         doc_participant_id = random.choice(other_participants)
                         doc_pair_indices = self.sentence_to_subjects[sentence_id][doc_participant_id]
                         doc_pair_idx = random.choice(doc_pair_indices)
-                        doc_pair = self.pairs[doc_pair_idx]
+
+                        # Two-subject mode: indices are into all_ict_pairs
+                        # Standard mode:    indices are into self.pairs
+                        if self.doc_subject is not None:
+                            doc_pair = self.all_ict_pairs[doc_pair_idx]
+                        else:
+                            doc_pair = self.pairs[doc_pair_idx]
 
                         doc_eeg = doc_pair.get('doc_eeg', None)
                         if doc_eeg is None:
@@ -765,7 +800,9 @@ class SimplifiedEEGDataloader(Dataset):
                     # Pick a fresh random subject and a random pair from that subject
                     sampled_pid = random.choice(other_pids)
                     pair_indices = self.sentence_to_subjects[sentence_id][sampled_pid]
-                    raw_pair = self.pairs[random.choice(pair_indices)]
+                    # Two-subject: indices into all_ict_pairs; standard: into self.pairs
+                    pair_source = self.all_ict_pairs if self.doc_subject is not None else self.pairs
+                    raw_pair = pair_source[random.choice(pair_indices)]
                     raw_doc_eeg = raw_pair.get('doc_eeg', None)
 
                     if raw_doc_eeg is not None:
