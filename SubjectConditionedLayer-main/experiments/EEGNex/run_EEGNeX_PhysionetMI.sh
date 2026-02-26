@@ -4,12 +4,12 @@
 #=================================================================
 
 #SBATCH --export=ALL
-#SBATCH --partition=gpu --gpus=1 --mem-per-cpu=64000
+#SBATCH --partition=gpu --gpus=1 --mem-per-cpu=36000
 #SBATCH --account=moshfeghi-pmwc
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mail-user=niall.mcguire@strath.ac.uk
 #SBATCH --mail-type=END
-#SBATCH --job-name=sulora_physionet
+#SBATCH --job-name=sulora_eegnex
 #SBATCH --output=slurm-%j.out
 
 module purge
