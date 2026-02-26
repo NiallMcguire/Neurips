@@ -8,6 +8,15 @@
 # Purpose: Cross-subject EEG-EEG retrieval baseline. Static doc-subject
 #          pairing (fixed at preprocessing). No positive weighting.
 #          Serves as the direct comparison point for Cond2, 3, and 4.
+#
+# v2.3 fixes applied:
+#   --stratified_sampling : SubjectStratifiedSampler enforces subject diversity
+#                           in every training batch (round-robin across subjects).
+#                           Prevents the contrastive loss from being solved by
+#                           subject identity rather than sentence content.
+#   per-channel norm      : Always active from dataloader v2.2 — no flag needed.
+#                           Each electrode is independently normalised to N(0,1),
+#                           removing the spatial amplitude fingerprint.
 #=================================================================
 
 #SBATCH --export=ALL
@@ -40,6 +49,7 @@ python controller.py \
     --seed 42 \
     --subject_mode cross-subject \
     --multi_positive_eval \
-    --multi_positive_train
+    --multi_positive_train \
+    --stratified_sampling
 
 /opt/software/scripts/job_epilogue.sh
