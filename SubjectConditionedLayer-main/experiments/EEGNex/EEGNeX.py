@@ -82,7 +82,6 @@ class LoRAConvPerSubject(nn.Module):
             torch.nn.init.normal_(a.weight, mean=0.0, std=0.02)
         for b in self.lora_B:
             nn.init.zeros_(b.weight)
-            # torch.nn.init.normal_(b.weight, mean=0.0, std=0.02)
 
     def forward(self, x, subject_id: torch.LongTensor):
         """
@@ -410,7 +409,7 @@ class EEGNeX(EEGModuleMixin, nn.Module):
             x = self.block_2_0(x, subject_id)
             x = self.block_2_1(x)
 
-            x = self.block_3_0(x)  # , subject_id)
+            x = self.block_3_0(x)
             x = self.block_3_1(x)
 
             x = self.block_4_1(x, subject_id)
@@ -433,27 +432,20 @@ class EEGNeX(EEGModuleMixin, nn.Module):
         pad4 = 1
         pad5 = 1
 
-        # Stride is assumed to be equal to kernel size (p4 and p5)
-
         # Calculate time dimension after block 3 pooling
-        # Formula: floor((L_in + 2*padding - kernel_size) / stride) + 1
         T3 = math.floor((self.n_times + 2 * pad4 - p4) / p4) + 1
 
         # Calculate time dimension after block 5 pooling
         T5 = math.floor((T3 + 2 * pad5 - p5) / p5) + 1
 
-        # Calculate final flattened features (channels * 1 * time_dim)
-        # The spatial dimension is reduced to 1 after block 3's depthwise conv.
-        final_in_features = (
-            self.filter_1 * T5
-        )  # filter_1 is the number of channels before flatten
+        # Calculate final flattened features
+        final_in_features = self.filter_1 * T5
         return final_in_features
 
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-# from braindecode.models import EEGNeX
 from braindecode.preprocessing import (
     exponential_moving_standardize,
     preprocess,
@@ -472,19 +464,19 @@ def main(config):
     from utils import get_BNCI2014001
 
     data, labels, meta, channels = get_BNCI2014001(
-        # subject=[*range(1, 10)],
         subject=config["subject"],
         freq_min=config["freq"][0],
         freq_max=config["freq"][1],
     )
 
-    train_data = data[np.where(meta["session"] == "session_T")]
-    train_labels = labels[np.where(meta["session"] == "session_T")]
-    train_meta = meta.iloc[np.where(meta["session"] == "session_T")]
+    # FIX: MOABB >= 1.0 uses "0train" / "1test" instead of "session_T" / "session_E"
+    train_data = data[np.where(meta["session"] == "0train")]
+    train_labels = labels[np.where(meta["session"] == "0train")]
+    train_meta = meta.iloc[np.where(meta["session"] == "0train")]
 
-    test_data = data[np.where(meta["session"] == "session_E")]
-    test_labels = labels[np.where(meta["session"] == "session_E")]
-    test_meta = meta.iloc[np.where(meta["session"] == "session_E")]
+    test_data = data[np.where(meta["session"] == "1test")]
+    test_labels = labels[np.where(meta["session"] == "1test")]
+    test_meta = meta.iloc[np.where(meta["session"] == "1test")]
 
     train_data = train_data[:, :, 244:756]
     test_data = test_data[:, :, 244:756]
@@ -529,7 +521,6 @@ def main(config):
         n_chans=n_channels,
         n_outputs=n_classes,
         n_times=input_window_samples,
-        # final_conv_length='auto',
         mode=config["mode"],  # "vanilla" or "LoRA"
         rank=config["rank"],
         alpha=config["alpha"],
@@ -597,20 +588,21 @@ def main(config):
             }
         )
 
+    # --- Zero-shot evaluation on subject 1 with no adapter ---
     data, labels, meta, channels = get_BNCI2014001(
-        # subject=[*range(1, 10)],
         subject=[1],
         freq_min=config["freq"][0],
         freq_max=config["freq"][1],
     )
 
-    train_data = data[np.where(meta["session"] == "session_T")]
-    train_labels = labels[np.where(meta["session"] == "session_T")]
-    train_meta = meta.iloc[np.where(meta["session"] == "session_T")]
+    # FIX: same session name fix applied here
+    train_data = data[np.where(meta["session"] == "0train")]
+    train_labels = labels[np.where(meta["session"] == "0train")]
+    train_meta = meta.iloc[np.where(meta["session"] == "0train")]
 
-    test_data = data[np.where(meta["session"] == "session_E")]
-    test_labels = labels[np.where(meta["session"] == "session_E")]
-    test_meta = meta.iloc[np.where(meta["session"] == "session_E")]
+    test_data = data[np.where(meta["session"] == "1test")]
+    test_labels = labels[np.where(meta["session"] == "1test")]
+    test_meta = meta.iloc[np.where(meta["session"] == "1test")]
 
     train_data = train_data[:, :, 244:756]
     test_data = test_data[:, :, 244:756]
@@ -662,7 +654,6 @@ if __name__ == "__main__":
         "batch_size": 64,
         "weight_decay": 0.01,
         "lr": 0.001,
-        # "wandb_proj": "NeurIPS_Workshop_EEGNeX",
     }
 
     import random
@@ -675,12 +666,10 @@ if __name__ == "__main__":
     random.seed(config["seed"])
     torch.backends.cudnn.deterministic = True
 
-    #main(config)
-
     import wandb
 
     wandb.init(
-        project="NeurIPS_Workshop_EEGNeX",  # parameter["wandb_proj"],
+        project="NeurIPS_Workshop_EEGNeX",
         config=config,
         reinit=False,
     )
