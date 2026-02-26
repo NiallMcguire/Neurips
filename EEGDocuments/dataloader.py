@@ -310,8 +310,8 @@ class SimplifiedEEGDataloader(Dataset):
                         channel_stds[c] = std if std > 1e-6 else 1.0
 
                 subject_stats[participant_id] = {
-                    'mean': channel_means,   # [channels]
-                    'std':  channel_stds     # [channels]
+                    'mean': channel_means,   # [channels] ndarray
+                    'std':  channel_stds     # [channels] ndarray
                 }
 
                 if self.debug and len(subject_stats) <= 3:
@@ -582,6 +582,22 @@ class SimplifiedEEGDataloader(Dataset):
 
             # Per-channel normalization: broadcast over [words, time, channels]
             if hasattr(mean, '__len__'):
+                n_channels_tensor = eeg_tensor.shape[2]
+                n_channels_stats  = len(mean)
+
+                if n_channels_stats != n_channels_tensor:
+                    # Stats were computed on raw (unpadded) arrays; tensor has been
+                    # padded to global_max_channels.  Pad stats with neutral values
+                    # (mean=0, std=1) for the extra channels so normalization is a
+                    # no-op on padding columns.
+                    pad = n_channels_tensor - n_channels_stats
+                    if pad > 0:
+                        mean = np.concatenate([mean, np.zeros(pad,  dtype=np.float32)])
+                        std  = np.concatenate([std,  np.ones(pad,   dtype=np.float32)])
+                    else:
+                        mean = mean[:n_channels_tensor]
+                        std  = std[:n_channels_tensor]
+
                 mean_t = torch.tensor(mean, dtype=eeg_tensor.dtype).view(1, 1, -1)
                 std_t  = torch.tensor(std,  dtype=eeg_tensor.dtype).view(1, 1, -1)
                 # Only normalize non-padding positions (avoid dividing zero-padded words)
