@@ -41,7 +41,7 @@ python controller.py \
     --weight_decay 0.01 \
     --dropout 0.3 \
     --temperature 0.2 \
-    --uniformity_weight 0.5 \
+    --uniformity_weight 0.05 \
     --patience 10 \
     --epochs 50 \
     --batch_size 64 \
