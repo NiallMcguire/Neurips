@@ -331,7 +331,26 @@ def main(config):
 
     from utils import get_PhysionetMI
 
-    print(f"Loading PhysionetMI for subjects {config['subject']}...")
+    # --- Check data is downloaded before attempting to load ---
+    import os
+    DATA_DIR = os.path.expanduser("~/mne_data/MNE-eegbci-data/files/eegmmidb/1.0.0")
+    RUNS = [4, 6, 8, 10, 12, 14]
+    missing = []
+    for subject in config["subject"]:
+        subj_str = f"S{subject:03d}"
+        for run in RUNS:
+            fname = os.path.join(DATA_DIR, subj_str, f"{subj_str}R{run:02d}.edf")
+            if not os.path.exists(fname):
+                missing.append((subject, run))
+
+    if missing:
+        missing_subjects = sorted(set(s for s, _ in missing))
+        print(f"ERROR: {len(missing_subjects)} subjects not yet downloaded: {missing_subjects}")
+        print("Please run: python download_physionet.py")
+        print("Then resubmit this job.")
+        raise SystemExit(1)
+
+    print(f"All data present. Loading PhysionetMI for subjects {config['subject']}...")
     data, labels, meta, channels = get_PhysionetMI(
         subject=config["subject"],
         freq_min=config["freq"][0],
