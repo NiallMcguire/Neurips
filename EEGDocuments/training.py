@@ -62,6 +62,32 @@ def compute_raw_eeg_weights(raw_query_eegs: torch.Tensor,
     return weight_matrix
 
 
+def uniformity_loss(vectors, t=2):
+    """
+    Uniformity loss from Wang & Isola (2020): "Understanding Contrastive
+    Representation Learning through Alignment and Uniformity on the Hypersphere".
+
+    Penalises representation collapse by encouraging embeddings to be spread
+    uniformly across the hypersphere.  Should be added to the contrastive loss
+    with a small weight (e.g. 0.5).
+
+    Args:
+        vectors: [batch, dim] — L2-normalised embedding vectors
+        t: bandwidth parameter (default 2, from the paper)
+
+    Returns:
+        scalar loss (lower = more uniform = less collapsed)
+    """
+    if isinstance(vectors, list):
+        vectors = torch.stack([v.squeeze() for v in vectors])
+
+    vectors = vectors.squeeze(1) if vectors.dim() == 3 else vectors
+    vectors = F.normalize(vectors, p=2, dim=1)
+
+    sq_pdist = torch.pdist(vectors, p=2).pow(2)
+    return sq_pdist.mul(-t).exp().mean().log()
+
+
 def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
                              batch_metadata=None, multi_positive_train=False, debug_step=False,
                              text_loss_mode='standard',
@@ -387,7 +413,8 @@ def compute_alignment_metrics(query_vectors, doc_vectors, pooling_strategy, docu
 
 def train_step(model, batch, optimizer, device, step_num, debug=False,
                multi_positive_train=False, text_loss_mode='standard',
-               weighted_multi_positive=False):
+               weighted_multi_positive=False, temperature=0.07,
+               uniformity_weight=0.5):
     """
     Single training step WITH GRADIENT ANALYSIS.
 
@@ -451,6 +478,7 @@ def train_step(model, batch, optimizer, device, step_num, debug=False,
         outputs['query_vectors'],
         outputs['doc_vectors'],
         model.pooling_strategy,
+        temperature=temperature,
         batch_metadata=batch['metadata'],
         multi_positive_train=multi_positive_train,
         debug_step=debug_this_step,
@@ -459,6 +487,14 @@ def train_step(model, batch, optimizer, device, step_num, debug=False,
         raw_query_eegs=raw_query_eegs,
         raw_doc_eegs=raw_doc_eegs
     )
+
+    # Uniformity loss — penalises representation collapse by pushing embeddings
+    # apart on the hypersphere.  Applied to query vectors only (sufficient signal).
+    if uniformity_weight > 0:
+        u_loss = uniformity_loss(outputs['query_vectors'])
+        if debug_this_step:
+            print(f"  Contrastive loss: {loss.item():.4f}  Uniformity loss: {u_loss.item():.4f}")
+        loss = loss + uniformity_weight * u_loss
 
     # Compute alignment metrics
     metrics = compute_alignment_metrics(
@@ -644,7 +680,8 @@ def debug_temperature_sensitivity(model, batch, device, temperatures=[0.05, 0.07
     return results
 
 
-def validation_step(model, batch, device, text_loss_mode='standard', multi_positive_train=False):
+def validation_step(model, batch, device, text_loss_mode='standard', multi_positive_train=False,
+                    temperature=0.07):
     """Single validation step.
 
     multi_positive_train must match the training flag.  When True, validation
@@ -669,6 +706,7 @@ def validation_step(model, batch, device, text_loss_mode='standard', multi_posit
             outputs['query_vectors'],
             outputs['doc_vectors'],
             model.pooling_strategy,
+            temperature=temperature,
             batch_metadata=batch['metadata'],
             multi_positive_train=multi_positive_train,
             debug_step=False,
@@ -1049,7 +1087,7 @@ def perform_ranking_evaluation(model, dataloader, device, epoch_num, subset_size
 
 def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, debug=False,
                 multi_positive_train=False, text_loss_mode='standard',
-                weighted_multi_positive=False):
+                weighted_multi_positive=False, temperature=0.07, uniformity_weight=0.5):
     """Train for a single epoch WITH PERIODIC DEBUGGING"""
 
     model.train()
@@ -1078,7 +1116,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
             debug=debug_this_batch,
             multi_positive_train=multi_positive_train,
             text_loss_mode=text_loss_mode,
-            weighted_multi_positive=weighted_multi_positive
+            weighted_multi_positive=weighted_multi_positive,
+            temperature=temperature,
+            uniformity_weight=uniformity_weight
         )
 
         total_loss += loss
@@ -1109,7 +1149,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch_num, total_epochs, d
 
 
 def validate_epoch(model, val_dataloader, device, epoch_num, text_loss_mode='standard',
-                   multi_positive_train=False):
+                   multi_positive_train=False, temperature=0.07):
     """Validate for a single epoch.
 
     multi_positive_train must match the training flag so that val/loss is
@@ -1130,7 +1170,8 @@ def validate_epoch(model, val_dataloader, device, epoch_num, text_loss_mode='sta
         val_loss, val_metrics = validation_step(
             model, batch, device,
             text_loss_mode=text_loss_mode,
-            multi_positive_train=multi_positive_train
+            multi_positive_train=multi_positive_train,
+            temperature=temperature
         )
 
         total_val_loss += val_loss
@@ -1270,6 +1311,8 @@ def initialize_wandb(config):
 
             'seed': config.get('seed', 42),
             'loss_type': loss_type,
+            'temperature': config.get('temperature', 0.07),
+            'uniformity_weight': config.get('uniformity_weight', 0.5),
             'similarity_function': f'{pooling_strategy}_similarity',
             'trainable_params': config.get('trainable_params', 0),
             'total_params': config.get('total_params', 0)
@@ -1282,7 +1325,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
                           optimizer, num_epochs, patience=10, device='cuda',
                           debug=False, config=None, multi_positive_eval=False,
                           multi_positive_train=False, text_loss_mode='standard',
-                          weighted_multi_positive=False):
+                          weighted_multi_positive=False, temperature=0.07,
+                          uniformity_weight=0.5):
     """
     Complete training loop with validation and early stopping.
 
@@ -1315,6 +1359,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
     print(f"Multi-positive training:    {'ENABLED ✅' if multi_positive_train else 'DISABLED ❌'}")
     print(f"Weighted multi-positive:    {'ENABLED ✅' if weighted_multi_positive else 'DISABLED ❌'}")
     print(f"Dynamic doc-subj resample:  {'ENABLED ✅' if dynamic_resample else 'DISABLED ❌'}")
+    print(f"Temperature:                {temperature}")
+    print(f"Uniformity loss weight:     {uniformity_weight}")
     if document_type == 'text':
         mode_labels = {
             'standard': 'Standard CE (same-sentence treated as hard negative)',
@@ -1344,7 +1390,9 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             debug=debug,
             multi_positive_train=multi_positive_train,
             text_loss_mode=text_loss_mode,
-            weighted_multi_positive=weighted_multi_positive
+            weighted_multi_positive=weighted_multi_positive,
+            temperature=temperature,
+            uniformity_weight=uniformity_weight
         )
 
         val_loss, val_similarity = validate_epoch(
@@ -1353,7 +1401,8 @@ def train_alignment_model(model, train_dataloader, val_dataloader, test_dataload
             device=device,
             epoch_num=epoch_num,
             text_loss_mode=text_loss_mode,
-            multi_positive_train=multi_positive_train
+            multi_positive_train=multi_positive_train,
+            temperature=temperature
         )
 
         # Early stopping on val_similarity (higher = better).

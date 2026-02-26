@@ -2,8 +2,17 @@
 #=================================================================
 # CONDITION 4: EEG-Text Alignment (Multi-Positive CE)
 # Query: Subject A EEG → Document: Tokenized text of same sentence
-# Loss: Multi-positive CE — same-sentence batch duplicates treated as co-positives
-#       Mirrors the EEG-EEG loss formulation exactly for a fair comparison
+# Loss:  Multi-positive CE + uniformity loss
+#
+# Fixes applied (v2.3):
+#   --temperature 0.2       : same rationale as Cond1. EEG-Text similarities
+#                             also live in the high range at initialisation.
+#   --uniformity_weight 0.5 : uniformity loss on query (EEG) vectors.
+#   per-channel norm        : dataloader per-electrode normalization.
+#
+# Note: EEG-Text serves as the cross-modal ceiling. These fixes should
+#       benefit it too but the effect will be smaller since text docs
+#       have no subject fingerprint to exploit.
 #=================================================================
 
 #SBATCH --export=ALL
@@ -29,6 +38,8 @@ python controller.py \
     --lr 5e-5 \
     --weight_decay 0.01 \
     --dropout 0.3 \
+    --temperature 0.2 \
+    --uniformity_weight 0.5 \
     --patience 10 \
     --epochs 50 \
     --batch_size 64 \

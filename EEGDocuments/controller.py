@@ -293,6 +293,14 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
+    parser.add_argument('--temperature', type=float, default=0.2,
+                        help='Contrastive loss temperature. Default 0.2 is suitable for '
+                             'EEG cosine similarities that typically live in [0.65, 0.95]. '
+                             'The original 0.07 is too sharp for this range and causes '
+                             'representation collapse.')
+    parser.add_argument('--uniformity_weight', type=float, default=0.5,
+                        help='Weight for the uniformity loss term (Wang & Isola 2020) '
+                             'that penalises representation collapse. Set to 0 to disable.')
 
     # Experiment arguments
     parser.add_argument('--output_dir', default=None, help='Output directory (default: auto-generated)')
@@ -411,6 +419,8 @@ def main():
         'patience': args.patience,
         'weight_decay': args.weight_decay,
         'dropout': args.dropout,
+        'temperature': args.temperature,
+        'uniformity_weight': args.uniformity_weight,
 
         # Data config
         'holdout_subjects': args.holdout_subjects,
@@ -534,7 +544,9 @@ def main():
         multi_positive_eval=args.multi_positive_eval,
         multi_positive_train=args.multi_positive_train,
         text_loss_mode=args.text_loss_mode,
-        weighted_multi_positive=args.weighted_multi_positive
+        weighted_multi_positive=args.weighted_multi_positive,
+        temperature=args.temperature,
+        uniformity_weight=args.uniformity_weight
     )
 
     # Save trained model

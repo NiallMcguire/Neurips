@@ -2,12 +2,19 @@
 #=================================================================
 # CONDITION 1: EEG-EEG Alignment — Multi-Positive (Baseline)
 # Query:  Subject A EEG → Document: Subject B EEG (same sentence)
-# Loss:   Multi-positive CE (all subjects reading same sentence = positives)
-# Flags:  --multi_positive_train --multi_positive_eval
+# Loss:   Multi-positive CE + uniformity loss
 #
-# Purpose: Cross-subject EEG-EEG retrieval baseline. Static doc-subject
-#          pairing (fixed at preprocessing). No positive weighting.
-#          Serves as the direct comparison point for Cond2, 3, and 4.
+# Fixes applied (v2.3):
+#   --temperature 0.2       : raised from 0.07. At 0.07 EEG similarities
+#                             of 0.65-0.95 produce logits of 9-13, exp
+#                             values of 1e4-8e5, and a winner-takes-all
+#                             gradient that drives representation collapse.
+#                             0.2 spreads gradient across the full batch.
+#   --uniformity_weight 0.5 : Wang & Isola (2020) uniformity loss directly
+#                             penalises collapse. Added to contrastive loss.
+#   per-channel norm        : dataloader now normalizes per electrode rather
+#                             than one global scalar per subject, removing
+#                             per-channel DC offsets that carry subject ID.
 #=================================================================
 
 #SBATCH --export=ALL
@@ -33,6 +40,8 @@ python controller.py \
     --lr 5e-5 \
     --weight_decay 0.01 \
     --dropout 0.3 \
+    --temperature 0.2 \
+    --uniformity_weight 0.5 \
     --patience 10 \
     --epochs 50 \
     --batch_size 64 \

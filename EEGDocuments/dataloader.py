@@ -249,62 +249,79 @@ class SimplifiedEEGDataloader(Dataset):
 
     def _compute_subject_statistics(self):
         """
-        Compute per-subject mean and std for EEG normalization
-        This is CRITICAL for cross-subject generalization
-        """
-        subject_eegs = {}  # participant_id -> list of EEG arrays
+        Compute per-subject, PER-CHANNEL mean and std for EEG normalization.
 
-        # Collect all EEG data per subject
+        A single global scalar per subject only removes amplitude scale.
+        Per-channel normalization additionally removes the stable DC offset
+        and variance profile of each electrode — the primary remaining source
+        of subject-identity signal after global z-scoring.
+
+        Stores:
+            subject_stats[pid]['mean']  : np.ndarray [channels]
+            subject_stats[pid]['std']   : np.ndarray [channels]
+        """
+        subject_eegs = {}  # participant_id -> list of EEG arrays [words, time, channels]
+
         for pair in self.pairs:
             participant_id = pair.get('participant_id', 'unknown')
 
-            # Collect query EEG
             query_eeg = pair.get('query_eeg', None)
             if query_eeg is not None:
                 if participant_id not in subject_eegs:
                     subject_eegs[participant_id] = []
                 subject_eegs[participant_id].append(query_eeg)
 
-            # Collect doc EEG if available (for EEG-EEG alignment)
             if self.document_type == 'eeg':
                 doc_eeg = pair.get('doc_eeg', None)
                 if doc_eeg is not None:
                     subject_eegs[participant_id].append(doc_eeg)
 
-        # Compute statistics per subject
         subject_stats = {}
         for participant_id, eeg_list in subject_eegs.items():
             if len(eeg_list) == 0:
                 continue
 
             try:
-                all_values = []
+                arrays = []
                 for eeg in eeg_list:
                     eeg_array = np.array(eeg, dtype=np.float32)
-                    if len(eeg_array.shape) >= 2:
-                        all_values.append(eeg_array.reshape(-1))
+                    if eeg_array.ndim == 3:           # [words, time, channels]
+                        arrays.append(eeg_array)
+                    elif eeg_array.ndim == 2:         # [time, channels] — treat as 1 word
+                        arrays.append(eeg_array[np.newaxis])
 
-                if all_values:
-                    combined = np.concatenate(all_values)
-                    non_zero = combined[combined != 0]
+                if not arrays:
+                    continue
 
+                # Stack to [N_words_total, time, channels]
+                stacked = np.concatenate(arrays, axis=0)
+                n_channels = stacked.shape[2]
+
+                # Per-channel stats — compute over words × time, ignoring zeros
+                channel_means = np.zeros(n_channels, dtype=np.float32)
+                channel_stds  = np.ones(n_channels,  dtype=np.float32)
+
+                for c in range(n_channels):
+                    vals = stacked[:, :, c].reshape(-1)
+                    non_zero = vals[vals != 0]
                     if len(non_zero) > 0:
-                        subject_mean = np.mean(non_zero)
-                        subject_std = np.std(non_zero)
+                        channel_means[c] = np.mean(non_zero)
+                        std = np.std(non_zero)
+                        channel_stds[c] = std if std > 1e-6 else 1.0
 
-                        if subject_std < 1e-6:
-                            subject_std = 1.0
+                subject_stats[participant_id] = {
+                    'mean': channel_means,   # [channels]
+                    'std':  channel_stds     # [channels]
+                }
 
-                        subject_stats[participant_id] = {
-                            'mean': float(subject_mean),
-                            'std': float(subject_std)
-                        }
+                if self.debug and len(subject_stats) <= 3:
+                    print(f"    Subject {participant_id}: "
+                          f"mean range [{channel_means.min():.4f}, {channel_means.max():.4f}], "
+                          f"std range  [{channel_stds.min():.4f},  {channel_stds.max():.4f}]")
 
-                        if self.debug and len(subject_stats) <= 3:
-                            print(f"    Subject {participant_id}: mean={subject_mean:.4f}, std={subject_std:.4f}")
             except Exception as e:
                 if self.debug:
-                    print(f"    Warning: Could not compute stats for subject {participant_id}: {e}")
+                    print(f"    Warning: Could not compute stats for {participant_id}: {e}")
                 continue
 
         return subject_stats
@@ -546,32 +563,46 @@ class SimplifiedEEGDataloader(Dataset):
 
     def _normalize_eeg(self, eeg_tensor, participant_id='unknown'):
         """
-        Normalize EEG tensor using SUBJECT-SPECIFIC statistics
-        This is critical for cross-subject generalization
+        Normalize EEG tensor using per-channel, subject-specific statistics.
+
+        Subtracts each channel's mean and divides by its std independently.
+        This removes both global amplitude differences AND per-electrode DC
+        offsets/variance profiles — the two main sources of subject-identity
+        signal that survive a single global z-score.
+
+        eeg_tensor shape: [words, time, channels]
         """
         if not self.normalize_eeg:
             return eeg_tensor
 
         if participant_id in self.subject_stats:
             stats = self.subject_stats[participant_id]
-            subject_mean = stats['mean']
-            subject_std = stats['std']
-            normalized = (eeg_tensor - subject_mean) / subject_std
-            return normalized
+            mean = stats['mean']   # [channels] ndarray or scalar (backward compat)
+            std  = stats['std']    # [channels] ndarray or scalar
+
+            # Per-channel normalization: broadcast over [words, time, channels]
+            if hasattr(mean, '__len__'):
+                mean_t = torch.tensor(mean, dtype=eeg_tensor.dtype).view(1, 1, -1)
+                std_t  = torch.tensor(std,  dtype=eeg_tensor.dtype).view(1, 1, -1)
+                # Only normalize non-padding positions (avoid dividing zero-padded words)
+                non_pad_mask = (eeg_tensor.abs().sum(dim=(1, 2), keepdim=True) > 0)
+                normalized = eeg_tensor.clone()
+                normalized[non_pad_mask.expand_as(normalized)] = (
+                    (eeg_tensor - mean_t) / std_t
+                )[non_pad_mask.expand_as(normalized)]
+                return normalized
+            else:
+                # Fallback: old scalar stats (backward compatibility)
+                return (eeg_tensor - mean) / std
         else:
-            # Fallback to global normalization if subject stats not available
-            if len(eeg_tensor.shape) == 3:
-                non_zero_values = eeg_tensor[eeg_tensor != 0]
-
-                if non_zero_values.numel() > 0:
-                    mean = torch.mean(non_zero_values)
-                    std = torch.std(non_zero_values)
-
-                    if std < 1e-6:
-                        std = torch.tensor(1.0, device=eeg_tensor.device)
-
+            # Fallback: instance-level normalization if subject unknown
+            if eeg_tensor.dim() == 3:
+                non_zero = eeg_tensor[eeg_tensor != 0]
+                if non_zero.numel() > 0:
+                    mean = torch.mean(non_zero)
+                    std  = torch.std(non_zero)
+                    std  = std if std > 1e-6 else torch.tensor(1.0)
                     return (eeg_tensor - mean) / std
-
             return eeg_tensor
 
     def _tokenize_text(self, text):
