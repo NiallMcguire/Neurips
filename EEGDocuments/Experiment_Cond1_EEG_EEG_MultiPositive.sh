@@ -12,11 +12,20 @@
 # v2.3 fixes applied:
 #   --stratified_sampling : SubjectStratifiedSampler enforces subject diversity
 #                           in every training batch (round-robin across subjects).
-#                           Prevents the contrastive loss from being solved by
-#                           subject identity rather than sentence content.
 #   per-channel norm      : Always active from dataloader v2.2 — no flag needed.
-#                           Each electrode is independently normalised to N(0,1),
-#                           removing the spatial amplitude fingerprint.
+#
+# v2.2 model capacity reduction (overfitting countermeasure):
+#   --hidden_dim 256      : Down from 768. Reduces all linear layers and the
+#                           transformer d_model. Appropriate for the small
+#                           EEG-EEG document space (N_subjects x M_sentences).
+#   --eeg_num_layers 1    : Down from 2 transformer layers. Halves transformer
+#                           depth — the primary capacity lever for overfitting.
+#   --eeg_nhead 4         : Down from 8. Must divide hidden_dim evenly
+#                           (256 / 4 = 64 head_dim).
+#
+# Approximate parameter counts:
+#   Before (hidden=768, layers=2): ~8-9M EEG encoder params
+#   After  (hidden=256, layers=1): ~0.5M EEG encoder params
 #=================================================================
 
 #SBATCH --export=ALL
@@ -38,7 +47,9 @@ python controller.py \
     --document_type eeg \
     --pooling_strategy max \
     --eeg_arch transformer \
-    --hidden_dim 768 \
+    --hidden_dim 256 \
+    --eeg_num_layers 1 \
+    --eeg_nhead 4 \
     --lr 5e-5 \
     --weight_decay 0.01 \
     --dropout 0.3 \

@@ -315,6 +315,20 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=768, help='Hidden dimension size')
     parser.add_argument('--eeg_arch', default='simple', choices=['simple', 'complex', 'transformer'],
                         help='EEG encoder architecture')
+    parser.add_argument('--eeg_num_layers', type=int, default=2,
+                        help=(
+                            'Number of TransformerEncoderLayers in the EEG encoder '
+                            '(only applies when --eeg_arch transformer). '
+                            'Default 2. Set to 1 to halve transformer capacity — '
+                            'recommended for EEG-EEG conditions to reduce overfitting.'
+                        ))
+    parser.add_argument('--eeg_nhead', type=int, default=8,
+                        help=(
+                            'Number of attention heads in each TransformerEncoderLayer '
+                            '(only applies when --eeg_arch transformer). '
+                            'Must divide --hidden_dim evenly. Default 8. '
+                            'Use 4 if --hidden_dim is reduced to 256.'
+                        ))
     parser.add_argument('--weight_decay', type=float, default=0.01,
                         help='Weight decay for L2 regularization')
 
@@ -361,6 +375,11 @@ def main():
 
     if args.stratified_sampling and args.subject_mode != 'cross-subject':
         print(f"⚠️  Note: --stratified_sampling has no effect when --subject_mode=within-subject.")
+
+    if args.eeg_arch == 'transformer' and args.hidden_dim % args.eeg_nhead != 0:
+        raise ValueError(
+            f"--hidden_dim ({args.hidden_dim}) must be divisible by --eeg_nhead ({args.eeg_nhead}). "
+            f"Try --eeg_nhead 4 when --hidden_dim 256.")
 
     # ────────────────────────────────────────────────────────────────────────
 
@@ -442,6 +461,8 @@ def main():
         'hidden_dim': args.hidden_dim,
         'pooling_strategy': args.pooling_strategy,
         'eeg_arch': args.eeg_arch,
+        'eeg_num_layers': args.eeg_num_layers,
+        'eeg_nhead': args.eeg_nhead,
 
         # Training config
         'batch_size': args.batch_size,
@@ -478,6 +499,8 @@ def main():
     print(f"Subject Mode: {args.subject_mode}")
     print(f"Pooling Strategy: {args.pooling_strategy}")
     print(f"EEG Architecture: {args.eeg_arch}")
+    if args.eeg_arch == 'transformer':
+        print(f"Transformer Layers: {args.eeg_num_layers}  |  Attention Heads: {args.eeg_nhead}")
     print(f"Multi-Positive Eval:       {'✅ ENABLED' if args.multi_positive_eval else '❌ DISABLED'}")
     print(f"Multi-Positive Train:      {'✅ ENABLED' if args.multi_positive_train else '❌ DISABLED'}")
     print(f"Dynamic Doc-Subj Resample: {'✅ ENABLED (train only)' if args.dynamic_resample else '❌ DISABLED'}")
@@ -522,7 +545,9 @@ def main():
         device=device,
         dropout=args.dropout,
         doc_encoder_type=args.doc_encoder_type,
-        freeze_doc_encoder=args.freeze_doc_encoder
+        freeze_doc_encoder=args.freeze_doc_encoder,
+        eeg_num_layers=args.eeg_num_layers,
+        eeg_nhead=args.eeg_nhead
     )
 
     if tokenizer and args.document_type == 'text':

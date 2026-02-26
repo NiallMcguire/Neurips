@@ -15,6 +15,17 @@ v2.1 additions:
         EEG-Text  / bert encoder  → freezes TextEncoder
         EEG-Text  / eeg  encoder  → freezes text_doc_eeg_encoder
         EEG-EEG              → creates a separate doc_eeg_encoder and freezes it
+
+v2.2 additions:
+  eeg_num_layers : int (default 2)
+      Number of TransformerEncoder layers in EEGEncoder when arch='transformer'.
+      Reducing this (e.g. to 1) is the primary lever for cutting model capacity
+      in the EEG-EEG condition, where the document space is small enough that
+      a deep encoder is unnecessary and prone to overfitting.
+  eeg_nhead : int (default 8)
+      Number of attention heads in each TransformerEncoderLayer.
+      Must divide hidden_dim evenly (e.g. hidden_dim=256, eeg_nhead=4 or 8).
+      Also controls the cls_transformer head count when pooling_strategy='cls'.
 """
 
 import torch
@@ -27,7 +38,19 @@ from peft import LoraConfig, get_peft_model, TaskType
 class EEGEncoder(nn.Module):
     """EEG encoder with different architecture options and STRONG regularization"""
 
-    def __init__(self, input_size, hidden_dim=768, arch='simple', dropout=0.3):
+    def __init__(self, input_size, hidden_dim=768, arch='simple', dropout=0.3,
+                 num_layers=2, nhead=8):
+        """
+        Args:
+            input_size:  Flattened EEG feature size (time * channels).
+            hidden_dim:  Width of all internal layers and output dimension.
+            arch:        'simple' | 'complex' | 'transformer'.
+            dropout:     Dropout probability applied throughout.
+            num_layers:  Number of TransformerEncoderLayers (transformer arch only).
+                         Default 2.  Set to 1 to halve transformer capacity.
+            nhead:       Number of attention heads (transformer arch only).
+                         Must divide hidden_dim evenly. Default 8.
+        """
         super().__init__()
         self.arch = arch
         self.hidden_dim = hidden_dim
@@ -58,19 +81,22 @@ class EEGEncoder(nn.Module):
                 nn.Dropout(dropout)
             )
         elif arch == 'transformer':
+            if hidden_dim % nhead != 0:
+                raise ValueError(
+                    f"hidden_dim ({hidden_dim}) must be divisible by nhead ({nhead})")
             self.input_projection = nn.Linear(input_size, hidden_dim)
             self.input_norm = nn.LayerNorm(hidden_dim)
 
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
-                nhead=8,
+                nhead=nhead,
                 dim_feedforward=hidden_dim * 2,
                 dropout=dropout,
                 activation='relu',
                 batch_first=True,
                 norm_first=True
             )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
             self.output_projection = nn.Linear(hidden_dim, hidden_dim)
             self.output_dropout = nn.Dropout(dropout)
         else:
@@ -161,7 +187,7 @@ class EEGAlignmentModel(nn.Module):
                  hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
                  use_lora=True, lora_r=16, lora_alpha=32, dropout=0.3,
                  global_eeg_dims=None, doc_encoder_type='bert',
-                 freeze_doc_encoder=False):
+                 freeze_doc_encoder=False, eeg_num_layers=2, eeg_nhead=8):
         super().__init__()
 
         self.document_type = document_type
@@ -170,6 +196,8 @@ class EEGAlignmentModel(nn.Module):
         self.eeg_arch = eeg_arch
         self.doc_encoder_type = doc_encoder_type
         self.freeze_doc_encoder = freeze_doc_encoder
+        self.eeg_num_layers = eeg_num_layers
+        self.eeg_nhead = eeg_nhead
 
         print(f"Creating EEG-{document_type.upper()} alignment model")
         print(f"Pooling strategy: {pooling_strategy}")
@@ -177,6 +205,8 @@ class EEGAlignmentModel(nn.Module):
         print(f"Dropout: {dropout}")
         print(f"Document encoder type: {doc_encoder_type.upper()}")
         print(f"Freeze document encoder: {'YES' if freeze_doc_encoder else 'NO'}")
+        if eeg_arch == 'transformer':
+            print(f"Transformer layers: {eeg_num_layers}  |  Attention heads: {eeg_nhead}")
 
         # ── EEG query encoder (always needed) ────────────────────────────────
         self.eeg_encoder = None
@@ -186,7 +216,9 @@ class EEGAlignmentModel(nn.Module):
         if global_eeg_dims is not None:
             max_words, max_time, max_channels = global_eeg_dims
             input_size = max_time * max_channels
-            self.eeg_encoder = EEGEncoder(input_size, hidden_dim, eeg_arch, dropout)
+            self.eeg_encoder = EEGEncoder(
+                input_size, hidden_dim, eeg_arch, dropout,
+                num_layers=eeg_num_layers, nhead=eeg_nhead)
             print(f"Initialized EEG query encoder with input size {input_size}")
 
         # ── Document encoder ─────────────────────────────────────────────────
@@ -255,7 +287,8 @@ class EEGAlignmentModel(nn.Module):
                     max_words, max_time, max_channels = global_eeg_dims
                     input_size = max_time * max_channels
                     self.doc_eeg_encoder = EEGEncoder(
-                        input_size, hidden_dim, eeg_arch, dropout)
+                        input_size, hidden_dim, eeg_arch, dropout,
+                        num_layers=eeg_num_layers, nhead=eeg_nhead)
                     print("Initialized separate (frozen) EEG document encoder")
                     for param in self.doc_eeg_encoder.parameters():
                         param.requires_grad = False
@@ -271,7 +304,7 @@ class EEGAlignmentModel(nn.Module):
                     torch.randn(1, 1, hidden_dim) * 0.02)
 
             encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim, nhead=8, dim_feedforward=hidden_dim * 2,
+                d_model=hidden_dim, nhead=eeg_nhead, dim_feedforward=hidden_dim * 2,
                 dropout=dropout, batch_first=True, norm_first=True
             )
             self.cls_transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
@@ -291,8 +324,11 @@ class EEGAlignmentModel(nn.Module):
 
     def _create_eeg_encoder(self, input_size, device):
         """Lazy-create query EEG encoder if global_eeg_dims was not available at init."""
-        encoder = EEGEncoder(input_size, self.hidden_dim, self.eeg_arch)
-        print(f"Created EEG encoder ({self.eeg_arch}) with input size {input_size}")
+        encoder = EEGEncoder(
+            input_size, self.hidden_dim, self.eeg_arch,
+            num_layers=self.eeg_num_layers, nhead=self.eeg_nhead)
+        print(f"Created EEG encoder ({self.eeg_arch}, layers={self.eeg_num_layers}, "
+              f"nhead={self.eeg_nhead}) with input size {input_size}")
         return encoder.to(device)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -609,7 +645,8 @@ def compute_single_vector_similarity(query_vectors, doc_vectors, temperature=1.0
 def create_alignment_model(document_type='text', colbert_model_name='bert-base-uncased',
                            hidden_dim=768, eeg_arch='simple', pooling_strategy='multi',
                            global_eeg_dims=None, device='cuda', dropout=0.3,
-                           doc_encoder_type='bert', freeze_doc_encoder=False):
+                           doc_encoder_type='bert', freeze_doc_encoder=False,
+                           eeg_num_layers=2, eeg_nhead=8):
     model = EEGAlignmentModel(
         document_type=document_type,
         colbert_model_name=colbert_model_name,
@@ -622,6 +659,8 @@ def create_alignment_model(document_type='text', colbert_model_name='bert-base-u
         dropout=dropout,
         global_eeg_dims=global_eeg_dims,
         doc_encoder_type=doc_encoder_type,
-        freeze_doc_encoder=freeze_doc_encoder
+        freeze_doc_encoder=freeze_doc_encoder,
+        eeg_num_layers=eeg_num_layers,
+        eeg_nhead=eeg_nhead
     )
     return model.to(device)
