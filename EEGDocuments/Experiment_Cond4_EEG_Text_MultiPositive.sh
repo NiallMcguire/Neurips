@@ -38,8 +38,7 @@ python controller.py \
     --lr 5e-5 \
     --weight_decay 0.01 \
     --dropout 0.3 \
-    --temperature 0.2 \
-    --uniformity_weight 0.5 \
+    --temperature 0.07 \
     --patience 10 \
     --epochs 50 \
     --batch_size 64 \

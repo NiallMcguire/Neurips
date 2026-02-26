@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
 Simplified Dataloader for EEG-EEG vs EEG-Text Alignment
-Version: 2.1
+Version: 2.2
 Focus: Support within-subject and cross-subject pairing
 New (v2.1): dynamic_resample flag for cross-subject EEG-EEG — re-samples the
             document subject on every __getitem__ call rather than locking it
             in at preprocessing time.  Only active when:
               document_type='eeg' AND subject_mode='cross-subject' AND dynamic_resample=True
+New (v2.2): Per-channel EEG normalisation — _compute_subject_statistics now stores
+            per-channel mean/std vectors instead of a single global scalar per subject.
+            This removes the spatial fingerprint (channel amplitude ratios) that the
+            model could exploit as a subject-identity shortcut, whilst preserving the
+            temporal dynamics that carry semantic content.
+            SubjectStratifiedSampler — custom BatchSampler that enforces subject
+            diversity within every batch by cycling round-robin across subjects.
+            Prevents batches from being dominated by a single subject's data, forcing
+            the contrastive loss to discriminate on sentence content rather than on
+            easily-separable subject fingerprints.
 """
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from pathlib import Path
 import random
 from typing import Dict, List, Optional, Tuple
@@ -249,79 +259,89 @@ class SimplifiedEEGDataloader(Dataset):
 
     def _compute_subject_statistics(self):
         """
-        Compute per-subject, PER-CHANNEL mean and std for EEG normalization.
+        Compute per-subject, per-channel mean and std for EEG normalisation.
 
-        A single global scalar per subject only removes amplitude scale.
-        Per-channel normalization additionally removes the stable DC offset
-        and variance profile of each electrode — the primary remaining source
-        of subject-identity signal after global z-scoring.
+        v2.2: Statistics are now computed independently for every electrode
+        channel rather than as a single global scalar across all channels and
+        timepoints.  This removes the spatial amplitude fingerprint that
+        distinguishes subjects at the channel level (e.g. subject A's frontal
+        channels are 3× stronger than subject B's), whilst preserving the
+        temporal dynamics within each channel that carry semantic content.
 
-        Stores:
-            subject_stats[pid]['mean']  : np.ndarray [channels]
-            subject_stats[pid]['std']   : np.ndarray [channels]
+        Stats are stored as 1-D numpy arrays of shape [n_channels] so that
+        _normalize_eeg can broadcast them across the [words, time, channels]
+        EEG tensor in a single vectorised operation.
         """
-        subject_eegs = {}  # participant_id -> list of EEG arrays [words, time, channels]
+        subject_eegs = {}  # participant_id -> list of EEG arrays
 
+        # Collect all EEG data per subject
         for pair in self.pairs:
             participant_id = pair.get('participant_id', 'unknown')
 
+            # Collect query EEG
             query_eeg = pair.get('query_eeg', None)
             if query_eeg is not None:
-                if participant_id not in subject_eegs:
-                    subject_eegs[participant_id] = []
-                subject_eegs[participant_id].append(query_eeg)
+                subject_eegs.setdefault(participant_id, []).append(query_eeg)
 
+            # Collect doc EEG if available (for EEG-EEG alignment)
             if self.document_type == 'eeg':
                 doc_eeg = pair.get('doc_eeg', None)
                 if doc_eeg is not None:
-                    subject_eegs[participant_id].append(doc_eeg)
+                    subject_eegs.setdefault(participant_id, []).append(doc_eeg)
 
+        # Compute per-channel statistics per subject
         subject_stats = {}
         for participant_id, eeg_list in subject_eegs.items():
-            if len(eeg_list) == 0:
+            if not eeg_list:
                 continue
 
             try:
-                arrays = []
+                # Flatten each EEG to [N_samples, n_channels] by collapsing
+                # words and time dimensions, then stack across all recordings.
+                channel_rows = []
                 for eeg in eeg_list:
                     eeg_array = np.array(eeg, dtype=np.float32)
-                    if eeg_array.ndim == 3:           # [words, time, channels]
-                        arrays.append(eeg_array)
-                    elif eeg_array.ndim == 2:         # [time, channels] — treat as 1 word
-                        arrays.append(eeg_array[np.newaxis])
+                    if eeg_array.ndim == 3:
+                        # [words, time, channels] → [words*time, channels]
+                        n_channels = eeg_array.shape[-1]
+                        channel_rows.append(eeg_array.reshape(-1, n_channels))
+                    elif eeg_array.ndim == 2:
+                        # [time, channels]
+                        channel_rows.append(eeg_array)
+                    # 1-D or unexpected shapes are skipped
 
-                if not arrays:
+                if not channel_rows:
                     continue
 
-                # Stack to [N_words_total, time, channels]
-                stacked = np.concatenate(arrays, axis=0)
-                n_channels = stacked.shape[2]
+                # Stack → [total_samples, n_channels]
+                stacked = np.concatenate(channel_rows, axis=0)
 
-                # Per-channel stats — compute over words × time, ignoring zeros
-                channel_means = np.zeros(n_channels, dtype=np.float32)
-                channel_stds  = np.ones(n_channels,  dtype=np.float32)
+                # Exclude all-zero rows (padding artefacts) from statistics
+                non_zero_mask = (stacked != 0).any(axis=1)
+                stacked = stacked[non_zero_mask]
 
-                for c in range(n_channels):
-                    vals = stacked[:, :, c].reshape(-1)
-                    non_zero = vals[vals != 0]
-                    if len(non_zero) > 0:
-                        channel_means[c] = np.mean(non_zero)
-                        std = np.std(non_zero)
-                        channel_stds[c] = std if std > 1e-6 else 1.0
+                if stacked.shape[0] == 0:
+                    continue
+
+                chan_mean = stacked.mean(axis=0)           # [n_channels]
+                chan_std  = stacked.std(axis=0)            # [n_channels]
+                # Guard against dead channels with zero variance
+                chan_std  = np.where(chan_std < 1e-6, 1.0, chan_std)
 
                 subject_stats[participant_id] = {
-                    'mean': channel_means,   # [channels] ndarray
-                    'std':  channel_stds     # [channels] ndarray
+                    'mean': chan_mean,   # ndarray [n_channels]
+                    'std':  chan_std,    # ndarray [n_channels]
                 }
 
                 if self.debug and len(subject_stats) <= 3:
                     print(f"    Subject {participant_id}: "
-                          f"mean range [{channel_means.min():.4f}, {channel_means.max():.4f}], "
-                          f"std range  [{channel_stds.min():.4f},  {channel_stds.max():.4f}]")
+                          f"chan_mean μ={chan_mean.mean():.4f} σ={chan_mean.std():.4f}, "
+                          f"chan_std  μ={chan_std.mean():.4f} σ={chan_std.std():.4f} "
+                          f"({stacked.shape[1]} channels)")
 
             except Exception as e:
                 if self.debug:
-                    print(f"    Warning: Could not compute stats for {participant_id}: {e}")
+                    print(f"    Warning: Could not compute stats for subject {participant_id}: {e}")
                 continue
 
         return subject_stats
@@ -563,62 +583,69 @@ class SimplifiedEEGDataloader(Dataset):
 
     def _normalize_eeg(self, eeg_tensor, participant_id='unknown'):
         """
-        Normalize EEG tensor using per-channel, subject-specific statistics.
+        Normalise EEG tensor using per-subject, per-channel statistics (v2.2).
 
-        Subtracts each channel's mean and divides by its std independently.
-        This removes both global amplitude differences AND per-electrode DC
-        offsets/variance profiles — the two main sources of subject-identity
-        signal that survive a single global z-score.
+        v2.1 used a single scalar mean/std per subject, which equalised global
+        amplitude but left the relative channel-amplitude pattern intact.  That
+        spatial pattern is a strong subject fingerprint the model can exploit.
 
-        eeg_tensor shape: [words, time, channels]
+        v2.2 computes mean and std independently for every electrode channel,
+        then subtracts and scales each channel to N(0,1).  This removes the
+        spatial fingerprint while keeping the temporal structure within channels.
+
+        Args:
+            eeg_tensor:     torch.Tensor of shape [words, time, channels]
+            participant_id: subject ID used to look up stored statistics
+
+        Returns:
+            Normalised tensor of the same shape.
         """
         if not self.normalize_eeg:
             return eeg_tensor
 
         if participant_id in self.subject_stats:
-            stats = self.subject_stats[participant_id]
-            mean = stats['mean']   # [channels] ndarray or scalar (backward compat)
-            std  = stats['std']    # [channels] ndarray or scalar
+            stats      = self.subject_stats[participant_id]
+            chan_mean   = torch.tensor(stats['mean'], dtype=torch.float32)  # [C_stored]
+            chan_std    = torch.tensor(stats['std'],  dtype=torch.float32)  # [C_stored]
 
-            # Per-channel normalization: broadcast over [words, time, channels]
-            if hasattr(mean, '__len__'):
-                n_channels_tensor = eeg_tensor.shape[2]
-                n_channels_stats  = len(mean)
+            n_stored = chan_mean.shape[0]
+            n_actual = eeg_tensor.shape[-1]          # channels in this tensor
 
-                if n_channels_stats != n_channels_tensor:
-                    # Stats were computed on raw (unpadded) arrays; tensor has been
-                    # padded to global_max_channels.  Pad stats with neutral values
-                    # (mean=0, std=1) for the extra channels so normalization is a
-                    # no-op on padding columns.
-                    pad = n_channels_tensor - n_channels_stats
-                    if pad > 0:
-                        mean = np.concatenate([mean, np.zeros(pad,  dtype=np.float32)])
-                        std  = np.concatenate([std,  np.ones(pad,   dtype=np.float32)])
-                    else:
-                        mean = mean[:n_channels_tensor]
-                        std  = std[:n_channels_tensor]
-
-                mean_t = torch.tensor(mean, dtype=eeg_tensor.dtype).view(1, 1, -1)
-                std_t  = torch.tensor(std,  dtype=eeg_tensor.dtype).view(1, 1, -1)
-                # Only normalize non-padding positions (avoid dividing zero-padded words)
-                non_pad_mask = (eeg_tensor.abs().sum(dim=(1, 2), keepdim=True) > 0)
-                normalized = eeg_tensor.clone()
-                normalized[non_pad_mask.expand_as(normalized)] = (
-                    (eeg_tensor - mean_t) / std_t
-                )[non_pad_mask.expand_as(normalized)]
-                return normalized
+            if n_stored >= n_actual:
+                # Trim to the actual channel count (handles padding channels)
+                chan_mean = chan_mean[:n_actual]
+                chan_std  = chan_std[:n_actual]
             else:
-                # Fallback: old scalar stats (backward compatibility)
-                return (eeg_tensor - mean) / std
+                # Stored stats cover fewer channels than the tensor — pad with
+                # identity stats (mean=0, std=1) so padding channels pass through.
+                pad = n_actual - n_stored
+                chan_mean = torch.cat([chan_mean, torch.zeros(pad)])
+                chan_std  = torch.cat([chan_std,  torch.ones(pad)])
+
+            # Broadcast: eeg_tensor is [words, time, channels]
+            # chan_mean / chan_std are [channels] → broadcast over [words, time]
+            normalized = (eeg_tensor - chan_mean) / chan_std
+            return normalized
+
         else:
-            # Fallback: instance-level normalization if subject unknown
-            if eeg_tensor.dim() == 3:
-                non_zero = eeg_tensor[eeg_tensor != 0]
-                if non_zero.numel() > 0:
-                    mean = torch.mean(non_zero)
-                    std  = torch.std(non_zero)
-                    std  = std if std > 1e-6 else torch.tensor(1.0)
-                    return (eeg_tensor - mean) / std
+            # Fallback: compute per-channel stats on-the-fly from this tensor.
+            # Used when subject_stats lookup fails (e.g. unseen subject at test time).
+            if eeg_tensor.ndim == 3:
+                words, time, channels = eeg_tensor.shape
+                # Reshape to [words*time, channels] for per-channel computation
+                flat = eeg_tensor.reshape(-1, channels)
+                non_zero_rows = flat.abs().sum(dim=1) > 0
+                if non_zero_rows.sum() > 0:
+                    active = flat[non_zero_rows]
+                    chan_mean = active.mean(dim=0)                          # [channels]
+                    chan_std  = active.std(dim=0)                           # [channels]
+                    chan_std  = torch.where(
+                        chan_std < 1e-6,
+                        torch.ones_like(chan_std),
+                        chan_std
+                    )
+                    return (eeg_tensor - chan_mean) / chan_std
+
             return eeg_tensor
 
     def _tokenize_text(self, text):
@@ -810,6 +837,128 @@ def debug_batch(batch, print_details=True):
         print(f"  Sample query: '{meta['query_text'][:50]}...'")
         if document_type == 'text':
             print(f"  Sample doc: '{meta['doc_text'][:50]}...'")
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subject-Stratified Batch Sampler (v2.2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SubjectStratifiedSampler(Sampler):
+    """
+    Constructs batches that contain samples from many distinct subjects.
+
+    Without stratification, PyTorch's default random sampler produces batches
+    whose composition is proportional to the dataset's subject distribution.
+    If one subject contributed 400 of 1 000 total samples, ~40 % of each batch
+    will be that subject's data.  In-batch negatives are then dominated by
+    same-subject pairs, which the model can trivially discriminate by subject
+    identity rather than sentence content — causing the validation loss to
+    diverge while training loss keeps falling (the EEG-EEG divergence pattern).
+
+    Algorithm
+    ---------
+    1. Group sample indices by subject (query_participant_id).
+    2. Each epoch, shuffle the within-subject index lists independently.
+    3. Build batches by cycling through subjects in round-robin order,
+       drawing one sample per subject per cycle until the batch is full.
+    4. Batches that cannot be completed (end-of-data) are discarded so every
+       batch has exactly `batch_size` samples at uniform subject diversity.
+    5. The final list of batches is shuffled before yielding so the model
+       sees subjects in different sentence orderings each epoch.
+
+    Args:
+        dataset:    A SimplifiedEEGDataloader instance (must have processed_pairs).
+        batch_size: Number of samples per batch.
+        shuffle:    Shuffle within-subject lists and batch order each epoch.
+        seed:       Base random seed; incremented each call to set_epoch().
+    """
+
+    def __init__(self, dataset, batch_size: int, shuffle: bool = True, seed: int = 42):
+        super().__init__(dataset)
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+        self.seed       = seed
+        self._epoch     = 0
+
+        # Build subject → [sample indices] mapping from processed_pairs
+        subject_to_indices: Dict[str, List[int]] = {}
+        for idx, pair in enumerate(dataset.processed_pairs):
+            pid = pair.get('query_participant_id', 'unknown')
+            subject_to_indices.setdefault(pid, []).append(idx)
+
+        self.subjects        = sorted(subject_to_indices.keys())
+        self.subject_indices = subject_to_indices
+        self.n_subjects      = len(self.subjects)
+
+        total_samples = sum(len(v) for v in subject_to_indices.values())
+        n_batches     = total_samples // batch_size
+
+        print(f"SubjectStratifiedSampler initialised:")
+        print(f"  Subjects       : {self.n_subjects}")
+        print(f"  Total samples  : {total_samples}")
+        print(f"  Batch size     : {batch_size}")
+        print(f"  Batches/epoch  : {n_batches}  (drop_last=True)")
+        samples_per_subj = {pid: len(v) for pid, v in subject_to_indices.items()}
+        min_s = min(samples_per_subj.values())
+        max_s = max(samples_per_subj.values())
+        print(f"  Samples/subject: min={min_s}, max={max_s}")
+
+    # ------------------------------------------------------------------
+    def set_epoch(self, epoch: int):
+        """Call at the start of each epoch to advance the RNG seed."""
+        self._epoch = epoch
+
+    # ------------------------------------------------------------------
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+
+        # Shuffle within-subject lists independently each epoch
+        per_subject: Dict[str, List[int]] = {}
+        for pid in self.subjects:
+            indices = self.subject_indices[pid].copy()
+            if self.shuffle:
+                rng.shuffle(indices)
+            per_subject[pid] = indices
+
+        pointers   = {pid: 0 for pid in self.subjects}
+        exhausted  = set()
+        batches: List[List[int]] = []
+        current_batch: List[int] = []
+
+        # Round-robin: one sample per subject per pass
+        while len(exhausted) < self.n_subjects:
+            made_progress = False
+            for pid in self.subjects:
+                if pid in exhausted:
+                    continue
+                ptr = pointers[pid]
+                if ptr >= len(per_subject[pid]):
+                    exhausted.add(pid)
+                    continue
+
+                current_batch.append(per_subject[pid][ptr])
+                pointers[pid] += 1
+                made_progress = True
+
+                if len(current_batch) == self.batch_size:
+                    batches.append(current_batch)
+                    current_batch = []
+
+            if not made_progress:
+                break
+        # Incomplete final batch is dropped (drop_last behaviour)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        for batch in batches:
+            yield from batch
+
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:
+        total = sum(len(v) for v in self.subject_indices.values())
+        return (total // self.batch_size) * self.batch_size
 
 
 # Convenience aliases

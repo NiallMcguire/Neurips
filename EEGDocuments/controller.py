@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Simplified Controller for EEG-EEG vs EEG-Text Alignment Experiments
-Version: 2.2
+Version: 2.3
 Focus: Compare within-subject vs cross-subject alignment
 New (v2.1): text_loss_mode argument for EEG-Text loss formulation control
 New (v2.2): dynamic_resample and weighted_multi_positive flags for cross-subject EEG-EEG
+New (v2.3): stratified_sampling flag — uses SubjectStratifiedSampler for the train
+            DataLoader so every batch contains samples from many distinct subjects.
+            per_channel_norm is now always active (v2.2 dataloader default).
 """
 
 import torch
@@ -17,7 +20,8 @@ from transformers import AutoTokenizer
 import json
 from datetime import datetime
 
-from dataloader import SimplifiedEEGDataloader, simple_collate_fn, compute_global_eeg_dimensions
+from dataloader import (SimplifiedEEGDataloader, simple_collate_fn,
+                        compute_global_eeg_dimensions, SubjectStratifiedSampler)
 from models import create_alignment_model
 from training import train_simplified_model, finish_wandb
 
@@ -60,17 +64,21 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
                                   dataset_type='auto', holdout_subjects=False,
                                   document_type='text', global_eeg_dims=None,
                                   subject_mode='within-subject', multi_positive_eval=False,
-                                  dynamic_resample=False):
+                                  dynamic_resample=False, stratified_sampling=False):
     """
     Create simplified dataloaders for EEG alignment experiments
 
     Args:
-        document_type:       'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
-        subject_mode:        'within-subject' or 'cross-subject'
-        multi_positive_eval: If True, treat all recordings of same document as relevant during evaluation
-        dynamic_resample:    Re-sample the doc subject per __getitem__ call (cross-subject EEG-EEG only).
-                             Applied to the train split only — val/test use static sampling for
-                             reproducible evaluation.
+        document_type:        'text' for EEG-Text alignment, 'eeg' for EEG-EEG alignment
+        subject_mode:         'within-subject' or 'cross-subject'
+        multi_positive_eval:  If True, treat all recordings of same document as relevant during evaluation
+        dynamic_resample:     Re-sample the doc subject per __getitem__ call (cross-subject EEG-EEG only).
+                              Applied to the train split only — val/test use static sampling for
+                              reproducible evaluation.
+        stratified_sampling:  If True (and document_type='eeg', subject_mode='cross-subject'), use
+                              SubjectStratifiedSampler for the train DataLoader so that every batch
+                              contains samples drawn round-robin from many distinct subjects.
+                              Has no effect for EEG-Text or within-subject experiments.
     """
     print(f"Loading data from: {data_path}")
     print(f"Document type: {document_type.upper()}")
@@ -78,6 +86,13 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
     print(f"Split strategy: {'holdout subjects' if holdout_subjects else 'random sample'}")
     print(f"Multi-positive evaluation: {'ENABLED' if multi_positive_eval else 'DISABLED'}")
     print(f"Dynamic doc-subject resampling (train): {'ENABLED ✅' if dynamic_resample else 'DISABLED ❌'}")
+
+    _stratified_active = (
+        stratified_sampling
+        and document_type == 'eeg'
+        and subject_mode == 'cross-subject'
+    )
+    print(f"Subject-stratified batching (train):    {'ENABLED ✅' if _stratified_active else 'DISABLED ❌'}")
 
     if global_eeg_dims is None:
         global_eeg_dims = compute_global_eeg_dimensions(data_path, max_eeg_len, dataset_type)
@@ -112,7 +127,15 @@ def create_simplified_dataloaders(data_path, tokenizer, batch_size=8, max_text_l
         dynamic_resample=False  # always static for test
     )
 
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
+                                  shuffle=not _stratified_active,   # mutually exclusive with sampler
+                                  sampler=(SubjectStratifiedSampler(
+                                               train_dataset,
+                                               batch_size=batch_size,
+                                               shuffle=True,
+                                               seed=42)
+                                           if _stratified_active else None),
+                                  batch_sampler=None,
                                   collate_fn=simple_collate_fn, num_workers=0,
                                   pin_memory=torch.cuda.is_available())
 
@@ -241,6 +264,17 @@ def main():
                             'Only active when --multi_positive_train is also set and '
                             '--document_type eeg. Has no effect otherwise.'
                         ))
+
+    parser.add_argument('--stratified_sampling', action='store_true',
+                        help=(
+                            'Use SubjectStratifiedSampler for the training DataLoader. '
+                            'Batches are constructed round-robin across subjects so that '
+                            'every batch contains samples from many distinct subjects. '
+                            'This prevents the contrastive loss from discriminating on '
+                            'subject identity rather than sentence content. '
+                            'Only active when --document_type eeg and '
+                            '--subject_mode cross-subject. Has no effect otherwise.'
+                        ))
     # ────────────────────────────────────────────────────────────────────────
 
     # Text loss mode argument
@@ -293,14 +327,6 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
-    parser.add_argument('--temperature', type=float, default=0.2,
-                        help='Contrastive loss temperature. Default 0.2 is suitable for '
-                             'EEG cosine similarities that typically live in [0.65, 0.95]. '
-                             'The original 0.07 is too sharp for this range and causes '
-                             'representation collapse.')
-    parser.add_argument('--uniformity_weight', type=float, default=0.5,
-                        help='Weight for the uniformity loss term (Wang & Isola 2020) '
-                             'that penalises representation collapse. Set to 0 to disable.')
 
     # Experiment arguments
     parser.add_argument('--output_dir', default=None, help='Output directory (default: auto-generated)')
@@ -329,6 +355,12 @@ def main():
     if args.weighted_multi_positive and args.document_type != 'eeg':
         print(f"⚠️  Note: --weighted_multi_positive only applies to EEG-EEG training. "
               f"It has no effect when --document_type=text.")
+
+    if args.stratified_sampling and args.document_type != 'eeg':
+        print(f"⚠️  Note: --stratified_sampling has no effect when --document_type=text.")
+
+    if args.stratified_sampling and args.subject_mode != 'cross-subject':
+        print(f"⚠️  Note: --stratified_sampling has no effect when --subject_mode=within-subject.")
 
     # ────────────────────────────────────────────────────────────────────────
 
@@ -372,7 +404,8 @@ def main():
         dataset_type=args.dataset_type, holdout_subjects=args.holdout_subjects,
         document_type=args.document_type, subject_mode=args.subject_mode,
         multi_positive_eval=args.multi_positive_eval,
-        dynamic_resample=args.dynamic_resample
+        dynamic_resample=args.dynamic_resample,
+        stratified_sampling=args.stratified_sampling
     )
 
     train_subjects = len(train_dataloader.dataset.unique_subjects)
@@ -399,6 +432,7 @@ def main():
         'multi_positive_train': args.multi_positive_train,
         'dynamic_resample': args.dynamic_resample,
         'weighted_multi_positive': args.weighted_multi_positive,
+        'stratified_sampling': args.stratified_sampling,
         'text_loss_mode': args.text_loss_mode,
         'doc_encoder_type': args.doc_encoder_type,
         'freeze_doc_encoder': args.freeze_doc_encoder,
@@ -419,8 +453,6 @@ def main():
         'patience': args.patience,
         'weight_decay': args.weight_decay,
         'dropout': args.dropout,
-        'temperature': args.temperature,
-        'uniformity_weight': args.uniformity_weight,
 
         # Data config
         'holdout_subjects': args.holdout_subjects,
@@ -450,6 +482,7 @@ def main():
     print(f"Multi-Positive Train:      {'✅ ENABLED' if args.multi_positive_train else '❌ DISABLED'}")
     print(f"Dynamic Doc-Subj Resample: {'✅ ENABLED (train only)' if args.dynamic_resample else '❌ DISABLED'}")
     print(f"Weighted Multi-Positive:   {'✅ ENABLED' if args.weighted_multi_positive else '❌ DISABLED'}")
+    print(f"Stratified Batching:       {'✅ ENABLED (train only)' if args.stratified_sampling else '❌ DISABLED'}")
 
     if args.document_type == 'text':
         mode_labels = {
@@ -544,9 +577,7 @@ def main():
         multi_positive_eval=args.multi_positive_eval,
         multi_positive_train=args.multi_positive_train,
         text_loss_mode=args.text_loss_mode,
-        weighted_multi_positive=args.weighted_multi_positive,
-        temperature=args.temperature,
-        uniformity_weight=args.uniformity_weight
+        weighted_multi_positive=args.weighted_multi_positive
     )
 
     # Save trained model
@@ -557,7 +588,8 @@ def main():
         f"_docenc{args.doc_encoder_type}"
         f"{'_frozen' if args.freeze_doc_encoder else ''}"
         f"{'_dynResample' if args.dynamic_resample else ''}"
-        f"{'_wtdMP' if args.weighted_multi_positive else ''}.pt"
+        f"{'_wtdMP' if args.weighted_multi_positive else ''}"
+        f"{'_stratBatch' if args.stratified_sampling else ''}.pt"
     )
     torch.save({
         'model_state_dict': trained_model.state_dict(),
@@ -575,6 +607,7 @@ def main():
     print(f"Multi-Positive Train:      {'ENABLED ✅' if args.multi_positive_train else 'DISABLED ❌'}")
     print(f"Dynamic Doc-Subj Resample: {'ENABLED ✅' if args.dynamic_resample else 'DISABLED ❌'}")
     print(f"Weighted Multi-Positive:   {'ENABLED ✅' if args.weighted_multi_positive else 'DISABLED ❌'}")
+    print(f"Stratified Batching:       {'ENABLED ✅' if args.stratified_sampling else 'DISABLED ❌'}")
     if args.document_type == 'text':
         print(f"Text Loss Mode: {args.text_loss_mode.upper()}")
         print(f"Doc Encoder Type: {args.doc_encoder_type.upper()}"
