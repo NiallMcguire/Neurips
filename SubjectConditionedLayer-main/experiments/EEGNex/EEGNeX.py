@@ -10,53 +10,8 @@ import torch
 import torch.nn as nn
 from einops.layers.torch import Rearrange
 
-# --- Braindecode stubs (replaces: from braindecode.models / braindecode.modules) ---
-# Avoids mne>=1.10.0 dependency that cannot install on Python 3.9 HPC environments.
-
-class EEGModuleMixin:
-    """Minimal stub replicating braindecode's EEGModuleMixin."""
-    def __init__(
-        self,
-        n_outputs=None,
-        n_chans=None,
-        chs_info=None,
-        n_times=None,
-        input_window_seconds=None,
-        sfreq=None,
-    ):
-        self.n_outputs = n_outputs
-        self.n_chans = n_chans
-        self.chs_info = chs_info
-        self.n_times = n_times
-        self.input_window_seconds = input_window_seconds
-        self.sfreq = sfreq
-
-
-class Conv2dWithConstraint(nn.Conv2d):
-    """Conv2d with a max-norm weight constraint."""
-    def __init__(self, *args, max_norm=1.0, **kwargs):
-        self.max_norm = max_norm
-        super().__init__(*args, **kwargs)
-
-    def forward(self, x):
-        self.weight.data = torch.renorm(
-            self.weight.data, p=2, dim=0, maxnorm=self.max_norm
-        )
-        return super().forward(x)
-
-
-class LinearWithConstraint(nn.Linear):
-    """Linear layer with a max-norm weight constraint."""
-    def __init__(self, *args, max_norm=1.0, **kwargs):
-        self.max_norm = max_norm
-        super().__init__(*args, **kwargs)
-
-    def forward(self, x):
-        self.weight.data = torch.renorm(
-            self.weight.data, p=2, dim=0, maxnorm=self.max_norm
-        )
-        return super().forward(x)
-# --- End stubs ---
+from braindecode.models import EEGModuleMixin
+from braindecode.modules import Conv2dWithConstraint, LinearWithConstraint
 
 
 class LoRAConvPerSubject(nn.Module):
