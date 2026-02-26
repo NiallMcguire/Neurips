@@ -642,15 +642,14 @@ def main(config):
 
 
 if __name__ == "__main__":
-
     config = {
         "mode": "LoRA",
-        "rank": 4,
-        "alpha": 12,  # paper recommends α ≈ 3r
+        "rank": 8,
+        "alpha": 24,  # α = 3r
         "num_adapters": 10,
         "freq": [8, 45],
         "subject": list(range(1, 10)),
-        "epochs": 50,  # paper uses 50 with early stopping
+        "epochs": 50,
         "batch_size": 64,
         "weight_decay": 0.01,
         "lr": 0.001,
