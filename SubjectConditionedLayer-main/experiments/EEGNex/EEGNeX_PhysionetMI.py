@@ -528,7 +528,7 @@ def main(config):
 if __name__ == "__main__":
 
     config = {
-        "mode": "LoRA",       # "vanilla" for subject-agnostic baseline
+        "mode": "vanilla",       # "vanilla" for subject-agnostic baseline
         "rank": 8,
         "alpha": 24,          # alpha = 3 * rank
         "freq": [8, 45],
