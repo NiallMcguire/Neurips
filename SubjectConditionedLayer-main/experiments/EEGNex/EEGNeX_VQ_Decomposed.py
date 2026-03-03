@@ -3,10 +3,10 @@
 # z_shared  -- discrete VQ code, shared across subjects
 # z_subject -- continuous subject residual
 #
-# Changes vs v2:
-#   1. dead_mask threshold  0.5  -> 1.0  (more aggressive restart)
-#   2. ema_decay            0.99 -> 0.95 (faster codebook tracking)
-#   3. lambda_vq            1.0  -> 2.0  (stronger encoder-codebook coupling)
+# Changes vs v3:
+#   1. filter_1          8    -> 16   (doubles d_shared: 64 -> 128)
+#   2. dead_mask         <1.0 -> <0.1 (less aggressive restart, allows stabilisation)
+#   3. lambda_vq         2.0  -> 1.0  (reduced now backbone is larger)
 # ============================================================
 
 import math
@@ -35,14 +35,14 @@ class VectorQuantizer(nn.Module):
       - Straight-through estimator for differentiability
       - EMA codebook updates (Van den Oord et al. Appendix A)
       - Laplace smoothing to resist dead codes
-      - Dead code restart: reinitialise unused entries from real batch samples
-        Threshold raised to < 1.0 (was 0.5) for more aggressive recycling
+      - Dead code restart with threshold 0.1 — allows codes to accumulate
+        stable statistics before being recycled, preventing churn
     """
 
     def __init__(
         self,
         codebook_size: int = 64,
-        embedding_dim: int = 64,
+        embedding_dim: int = 128,
         commitment_beta: float = 0.25,
         ema_decay: float = 0.95,
     ):
@@ -105,9 +105,10 @@ class VectorQuantizer(nn.Module):
                 )
 
                 # ── Dead code restart ────────────────────────────────────────
-                # Threshold raised to 1.0 (was 0.5) so codes are recycled more
-                # aggressively before they fully die and stop competing.
-                dead_mask = self.ema_cluster_size < 1.0
+                # Threshold 0.1 (was 1.0) — codes must be near-completely unused
+                # before being recycled. Prevents churn where active codes get
+                # wiped before building stable statistics.
+                dead_mask = self.ema_cluster_size < 0.1
                 n_dead = dead_mask.sum().item()
                 if n_dead > 0:
                     rand_idx = torch.randint(
@@ -169,7 +170,7 @@ class ReconstructionDecoder(nn.Module):
     """
     Reconstructs z_e from (z_shared, z_subject).
     Forces z_subject to encode whatever individual variation VQ discarded.
-    Target is z_e.detach() so reconstruction gradients don't perturb encoder.
+    Target is z_e.detach() so reconstruction gradients do not perturb encoder.
     """
 
     def __init__(self, d_shared: int, d_subject: int):
@@ -193,7 +194,11 @@ class ReconstructionDecoder(nn.Module):
 class EEGNeXBackbone(EEGModuleMixin, nn.Module):
     """
     Standard EEGNeX convolutional encoder shared across all subjects.
-    No subject-specific parameters. Outputs flat embedding [batch, out_features].
+    No subject-specific parameters anywhere in this module.
+    Outputs flat embedding [batch, out_features].
+
+    filter_1=16 gives out_features=256, d_shared=128 — double the previous
+    capacity which was too tight for the VQ bottleneck to learn from.
     """
 
     def __init__(
@@ -206,7 +211,7 @@ class EEGNeXBackbone(EEGModuleMixin, nn.Module):
         sfreq=None,
         activation=nn.ELU,
         depth_multiplier: int = 2,
-        filter_1: int = 8,
+        filter_1: int = 16,
         filter_2: int = 32,
         drop_prob: float = 0.5,
         kernel_block_1_2: int = 64,
@@ -351,7 +356,7 @@ class EEGNeXVQDecomposed(nn.Module):
         n_outputs: int,
         n_times: int,
         num_subjects: int,
-        filter_1: int = 8,
+        filter_1: int = 16,
         filter_2: int = 32,
         depth_multiplier: int = 2,
         drop_prob: float = 0.5,
@@ -408,7 +413,7 @@ class EEGNeXVQDecomposed(nn.Module):
 
 def compute_loss(
     logits, labels, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
-    lambda_vq: float = 2.0,
+    lambda_vq: float = 1.0,
     lambda_recon: float = 0.5,
     lambda_ortho: float = 1.0,
 ):
@@ -573,6 +578,7 @@ def main(config):
         n_outputs=len(np.unique(labels)),
         n_times=data.shape[2],
         num_subjects=num_subjects,
+        filter_1=config["filter_1"],
         codebook_size=config["codebook_size"],
         commitment_beta=config["commitment_beta"],
         ema_decay=config["ema_decay"],
@@ -731,14 +737,17 @@ if __name__ == "__main__":
         "weight_decay": 0.01,
         "patience":     10,
 
+        # Backbone
+        "filter_1": 16,          # was 8 -- doubles out_features to 256, d_shared to 128
+
         # VQ
         "codebook_size":     64,
         "commitment_beta":   0.25,
-        "ema_decay":         0.95,   # was 0.99 -- faster codebook tracking
+        "ema_decay":         0.95,
         "warmstart_batches": 10,
 
         # Loss weights
-        "lambda_vq":    2.0,         # was 1.0 -- stronger encoder-codebook coupling
+        "lambda_vq":    1.0,     # was 2.0 -- reduced now backbone is larger
         "lambda_recon": 0.5,
         "lambda_ortho": 1.0,
     }
