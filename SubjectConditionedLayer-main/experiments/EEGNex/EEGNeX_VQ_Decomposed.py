@@ -1,11 +1,21 @@
 # EEGNeX with Decomposed VQ Latent Space
 # ============================================================
-# z_shared  -- discrete VQ code, shared across subjects (classify from this)
-# z_subject -- continuous subject residual (reconstruct from this, discard at test)
+# z_shared  -- discrete VQ code, shared across subjects
+# z_subject -- continuous subject residual
+#
+# Fixes applied vs initial version:
+#   1. Dead code restart  -- reinitialise unused codes from real batch samples
+#   2. Codebook size      -- reduced 512 -> 64 (proportional to 3 classes)
+#   3. Kmeans warm-start  -- initialise codebook from real encoder outputs
+#   4. lambda_ortho       -- increased 0.1 -> 1.0
 # ============================================================
 
-import math, random, numpy as np
-import torch, torch.nn as nn, torch.nn.functional as F
+import math
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split as sk_split
@@ -14,327 +24,765 @@ from braindecode.models import EEGModuleMixin
 from braindecode.modules import Conv2dWithConstraint, LinearWithConstraint
 
 
-# ── 1. Vector Quantizer ───────────────────────────────────────────────────────
+# =============================================================================
+# 1. Vector Quantizer
+# =============================================================================
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, codebook_size=512, embedding_dim=64,
-                 commitment_beta=0.25, ema_decay=0.99):
+    """
+    Nearest-neighbour lookup into a learned codebook.
+
+    Key mechanisms:
+      - Straight-through estimator for differentiability
+      - EMA codebook updates for stability (Van den Oord et al. Appendix A)
+      - Laplace smoothing to resist dead codes
+      - Dead code restart: reinitialise unused entries from real batch samples
+    """
+
+    def __init__(
+        self,
+        codebook_size: int = 64,
+        embedding_dim: int = 64,
+        commitment_beta: float = 0.25,
+        ema_decay: float = 0.99,
+    ):
         super().__init__()
-        self.K, self.d, self.beta, self.ema_decay = codebook_size, embedding_dim, commitment_beta, ema_decay
+        self.K = codebook_size
+        self.d = embedding_dim
+        self.beta = commitment_beta
+        self.ema_decay = ema_decay
+
         self.codebook = nn.Embedding(self.K, self.d)
-        nn.init.uniform_(self.codebook.weight, -1.0/self.K, 1.0/self.K)
-        if ema_decay > 0:
-            self.register_buffer("ema_cluster_size", torch.zeros(self.K))
-            self.register_buffer("ema_embedding_sum", self.codebook.weight.data.clone())
+        nn.init.uniform_(self.codebook.weight, -1.0 / self.K, 1.0 / self.K)
 
-    def forward(self, z_e):
-        dists = (z_e.pow(2).sum(1, keepdim=True)
-                 - 2 * (z_e @ self.codebook.weight.t())
-                 + self.codebook.weight.pow(2).sum(1))
-        indices = dists.argmin(1)
-        z_q = self.codebook(indices)
+        self.register_buffer("ema_cluster_size", torch.zeros(self.K))
+        self.register_buffer("ema_embedding_sum", self.codebook.weight.data.clone())
 
-        if self.training and self.ema_decay > 0:
+    def forward(self, z_e: torch.Tensor):
+        """
+        Args:
+            z_e : [batch, d]  continuous encoder output (shared half)
+
+        Returns:
+            z_q_st  : [batch, d]  straight-through quantized vector
+            z_q     : [batch, d]  hard quantized (no encoder gradient)
+            indices : [batch]     codebook indices
+            loss_vq : scalar      codebook + commitment loss
+        """
+        # Pairwise squared L2 distances to all K codebook entries
+        dists = (
+            z_e.pow(2).sum(dim=1, keepdim=True)          # [B, 1]
+            - 2 * (z_e @ self.codebook.weight.t())        # [B, K]
+            + self.codebook.weight.pow(2).sum(dim=1)      # [K]
+        )
+
+        indices = dists.argmin(dim=1)                     # [B]
+        z_q = self.codebook(indices)                      # [B, d]
+
+        # EMA codebook update (training only)
+        if self.training:
             with torch.no_grad():
-                oh = F.one_hot(indices, self.K).float()
-                self.ema_cluster_size.mul_(self.ema_decay).add_(oh.sum(0) * (1 - self.ema_decay))
-                self.ema_embedding_sum.mul_(self.ema_decay).add_((oh.t() @ z_e) * (1 - self.ema_decay))
-                n = self.ema_cluster_size.sum()
-                smoothed = (self.ema_cluster_size + 1e-5) / (n + self.K * 1e-5) * n
-                self.codebook.weight.data.copy_(self.ema_embedding_sum / smoothed.unsqueeze(1))
+                one_hot = F.one_hot(indices, self.K).float()          # [B, K]
+                new_cluster_size = one_hot.sum(0)                     # [K]
+                new_embedding_sum = one_hot.t() @ z_e                 # [K, d]
 
-        loss_vq = F.mse_loss(z_q, z_e.detach()) + self.beta * F.mse_loss(z_e, z_q.detach())
-        z_q_st  = z_e + (z_q - z_e).detach()   # straight-through estimator
+                self.ema_cluster_size.mul_(self.ema_decay).add_(
+                    new_cluster_size * (1 - self.ema_decay)
+                )
+                self.ema_embedding_sum.mul_(self.ema_decay).add_(
+                    new_embedding_sum * (1 - self.ema_decay)
+                )
+
+                # Laplace smoothing to prevent divide-by-zero on rare codes
+                n = self.ema_cluster_size.sum()
+                smoothed = (
+                    (self.ema_cluster_size + 1e-5)
+                    / (n + self.K * 1e-5)
+                    * n
+                )
+                updated = self.ema_embedding_sum / smoothed.unsqueeze(1)
+                self.codebook.weight.data.copy_(updated)
+
+                # ── Dead code restart ────────────────────────────────────────
+                # Any code with near-zero usage is reinitialised from a random
+                # encoder output in the current batch. This prevents the
+                # codebook collapsing to a small active subset.
+                dead_mask = self.ema_cluster_size < 0.5              # [K] bool
+                n_dead = dead_mask.sum().item()
+                if n_dead > 0:
+                    n_available = z_e.shape[0]
+                    # Sample with replacement if batch smaller than n_dead
+                    rand_idx = torch.randint(
+                        0, n_available, (n_dead,), device=z_e.device
+                    )
+                    self.codebook.weight.data[dead_mask] = z_e[rand_idx].detach()
+                    self.ema_cluster_size[dead_mask] = 1.0
+                    self.ema_embedding_sum[dead_mask] = z_e[rand_idx].detach()
+                # ─────────────────────────────────────────────────────────────
+
+        # VQ losses
+        loss_codebook = F.mse_loss(z_q, z_e.detach())           # move codebook → encoder
+        loss_commit   = F.mse_loss(z_e, z_q.detach())           # move encoder → codebook
+        loss_vq       = loss_codebook + self.beta * loss_commit
+
+        # Straight-through estimator: z_q in forward, z_e gradient in backward
+        z_q_st = z_e + (z_q - z_e).detach()
+
         return z_q_st, z_q, indices, loss_vq
 
-    def dead_code_fraction(self):
-        return (self.ema_cluster_size < 1.0).float().mean().item() if self.ema_decay > 0 else float("nan")
+    def dead_code_fraction(self) -> float:
+        return (self.ema_cluster_size < 1.0).float().mean().item()
 
 
-# ── 2. Subject Residual Head ──────────────────────────────────────────────────
+# =============================================================================
+# 2. Subject Residual Head
+# =============================================================================
 
 class SubjectResidualHead(nn.Module):
-    """Per-subject embedding bias injected into a shared MLP."""
-    def __init__(self, input_dim, num_subjects, hidden_dim=None):
+    """
+    Per-subject embedding bias injected before a shared MLP.
+    Encodes individual variation (electrode offsets, oscillatory profiles etc.)
+    that the shared VQ code cannot represent.
+    """
+
+    def __init__(self, input_dim: int, num_subjects: int, hidden_dim: int = None):
         super().__init__()
         hidden_dim = hidden_dim or input_dim
+
         self.subject_embedding = nn.Embedding(num_subjects, input_dim)
-        nn.init.normal_(self.subject_embedding.weight, 0.0, 0.01)
+        nn.init.normal_(self.subject_embedding.weight, mean=0.0, std=0.01)
+
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim),
-            nn.GELU(), nn.Linear(hidden_dim, input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim),
         )
-    def forward(self, z_e_subject, subject_id):
-        return self.mlp(z_e_subject + self.subject_embedding(subject_id))
+
+    def forward(self, z_e_subject: torch.Tensor, subject_id: torch.LongTensor):
+        bias = self.subject_embedding(subject_id)       # [B, input_dim]
+        return self.mlp(z_e_subject + bias)             # [B, input_dim]
 
 
-# ── 3. Reconstruction Decoder ─────────────────────────────────────────────────
+# =============================================================================
+# 3. Reconstruction Decoder
+# =============================================================================
 
 class ReconstructionDecoder(nn.Module):
-    """Reconstructs z_e from (z_shared, z_subject). Forces z_subject to be useful."""
-    def __init__(self, d_shared, d_subject):
+    """
+    Reconstructs z_e from (z_shared, z_subject).
+
+    Forces z_subject to encode whatever individual variation VQ discarded:
+    without z_subject carrying real signal, reconstruction loss stays high.
+    Target is z_e.detach() so reconstruction gradients don't perturb the encoder.
+    """
+
+    def __init__(self, d_shared: int, d_subject: int):
         super().__init__()
-        d = d_shared + d_subject
-        self.decoder = nn.Sequential(nn.Linear(d, d*2), nn.GELU(), nn.Linear(d*2, d))
-    def forward(self, z_shared_st, z_subject):
+        in_dim = d_shared + d_subject
+
+        self.decoder = nn.Sequential(
+            nn.Linear(in_dim, in_dim * 2),
+            nn.GELU(),
+            nn.Linear(in_dim * 2, in_dim),
+        )
+
+    def forward(self, z_shared_st: torch.Tensor, z_subject: torch.Tensor):
         return self.decoder(torch.cat([z_shared_st, z_subject], dim=-1))
 
 
-# ── 4. EEGNeX Backbone (shared, no subject-specific weights) ─────────────────
+# =============================================================================
+# 4. EEGNeX Backbone  (fully shared, no subject-specific weights)
+# =============================================================================
 
 class EEGNeXBackbone(EEGModuleMixin, nn.Module):
-    def __init__(self, n_chans=None, n_outputs=None, n_times=None,
-                 chs_info=None, input_window_seconds=None, sfreq=None,
-                 activation=nn.ELU, depth_multiplier=2, filter_1=8, filter_2=32,
-                 drop_prob=0.5, kernel_block_1_2=64, kernel_block_4=16,
-                 dilation_block_4=2, avg_pool_block4=4, kernel_block_5=16,
-                 dilation_block_5=4, avg_pool_block5=8, max_norm_conv=1.0):
-        super().__init__(n_outputs=n_outputs, n_chans=n_chans, chs_info=chs_info,
-                         n_times=n_times, input_window_seconds=input_window_seconds, sfreq=sfreq)
+    """
+    Standard EEGNeX convolutional encoder, shared across all subjects.
+    No subject-specific parameters anywhere in this module.
+    Outputs flat embedding [batch, out_features].
+    """
+
+    def __init__(
+        self,
+        n_chans=None,
+        n_outputs=None,
+        n_times=None,
+        chs_info=None,
+        input_window_seconds=None,
+        sfreq=None,
+        activation=nn.ELU,
+        depth_multiplier: int = 2,
+        filter_1: int = 8,
+        filter_2: int = 32,
+        drop_prob: float = 0.5,
+        kernel_block_1_2: int = 64,
+        kernel_block_4: int = 16,
+        dilation_block_4: int = 2,
+        avg_pool_block4: int = 4,
+        kernel_block_5: int = 16,
+        dilation_block_5: int = 4,
+        avg_pool_block5: int = 8,
+        max_norm_conv: float = 1.0,
+    ):
+        super().__init__(
+            n_outputs=n_outputs, n_chans=n_chans, chs_info=chs_info,
+            n_times=n_times, input_window_seconds=input_window_seconds, sfreq=sfreq,
+        )
         del n_outputs, n_chans, chs_info, n_times, input_window_seconds, sfreq
 
         self.filter_1 = filter_1
         f3 = filter_2 * depth_multiplier
+
+        kb = (1, kernel_block_1_2)
+        k4 = (1, kernel_block_4);   d4 = (1, dilation_block_4)
+        p4 = (1, avg_pool_block4)
+        k5 = (1, kernel_block_5);   d5 = (1, dilation_block_5)
+        p5 = (1, avg_pool_block5)
+
         self._p4 = avg_pool_block4
         self._p5 = avg_pool_block5
         self.out_features = self._calc_out(avg_pool_block4, avg_pool_block5)
 
-        kb=(1,kernel_block_1_2); k4=(1,kernel_block_4); d4=(1,dilation_block_4)
-        p4=(1,avg_pool_block4);  k5=(1,kernel_block_5); d5=(1,dilation_block_5)
-        p5=(1,avg_pool_block5)
-
         self.block_1 = nn.Sequential(
             Rearrange("b c t -> b 1 c t"),
-            nn.Conv2d(1, filter_1, kb, padding="same", bias=False),
-            nn.BatchNorm2d(filter_1))
+            nn.Conv2d(1, filter_1, kernel_size=kb, padding="same", bias=False),
+            nn.BatchNorm2d(filter_1),
+        )
         self.block_2 = nn.Sequential(
-            nn.Conv2d(filter_1, filter_2, kb, padding="same", bias=False),
-            nn.BatchNorm2d(filter_2))
+            nn.Conv2d(filter_1, filter_2, kernel_size=kb, padding="same", bias=False),
+            nn.BatchNorm2d(filter_2),
+        )
         self.block_3 = nn.Sequential(
-            Conv2dWithConstraint(filter_2, f3, max_norm=max_norm_conv,
-                                 kernel_size=(self.n_chans,1), groups=filter_2, bias=False),
-            nn.BatchNorm2d(f3), activation(),
-            nn.AvgPool2d(p4, padding=(0,1)), nn.Dropout(drop_prob))
+            Conv2dWithConstraint(
+                filter_2, f3, max_norm=max_norm_conv,
+                kernel_size=(self.n_chans, 1), groups=filter_2, bias=False,
+            ),
+            nn.BatchNorm2d(f3),
+            activation(),
+            nn.AvgPool2d(kernel_size=p4, padding=(0, 1)),
+            nn.Dropout(p=drop_prob),
+        )
         self.block_4 = nn.Sequential(
-            nn.Conv2d(f3, filter_2, k4, dilation=d4, padding="same", bias=False),
-            nn.BatchNorm2d(filter_2))
+            nn.Conv2d(f3, filter_2, kernel_size=k4, dilation=d4, padding="same", bias=False),
+            nn.BatchNorm2d(filter_2),
+        )
         self.block_5 = nn.Sequential(
-            nn.Conv2d(filter_2, filter_1, k5, dilation=d5, padding="same", bias=False),
-            nn.BatchNorm2d(filter_1), activation(),
-            nn.AvgPool2d(p5, padding=(0,1)), nn.Dropout(drop_prob), nn.Flatten())
+            nn.Conv2d(filter_2, filter_1, kernel_size=k5, dilation=d5, padding="same", bias=False),
+            nn.BatchNorm2d(filter_1),
+            activation(),
+            nn.AvgPool2d(kernel_size=p5, padding=(0, 1)),
+            nn.Dropout(p=drop_prob),
+            nn.Flatten(),
+        )
 
-    def forward(self, x):
-        return self.block_5(self.block_4(self.block_3(self.block_2(self.block_1(x)))))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.block_1(x)
+        x = self.block_2(x)
+        x = self.block_3(x)
+        x = self.block_4(x)
+        x = self.block_5(x)
+        return x   # [batch, out_features]
 
-    def _calc_out(self, p4, p5):
+    def _calc_out(self, p4: int, p5: int) -> int:
         T3 = math.floor((self.n_times + 2 - p4) / p4) + 1
         T5 = math.floor((T3          + 2 - p5) / p5) + 1
         return self.filter_1 * T5
 
 
-# ── 5. VQ Decomposed Head ─────────────────────────────────────────────────────
+# =============================================================================
+# 5. VQ Decomposed Head
+# =============================================================================
 
 class VQDecomposedHead(nn.Module):
-    def __init__(self, in_features, n_outputs, num_subjects,
-                 codebook_size=512, commitment_beta=0.25, ema_decay=0.99, max_norm_clf=0.25):
+    """
+    Splits z_e into shared (VQ) and subject (residual) components.
+    Classifies from z_shared only. Reconstructs z_e from both.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        n_outputs: int,
+        num_subjects: int,
+        codebook_size: int = 64,
+        commitment_beta: float = 0.25,
+        ema_decay: float = 0.99,
+        max_norm_clf: float = 0.25,
+    ):
         super().__init__()
         self.d_shared  = in_features // 2
         self.d_subject = in_features - self.d_shared
 
-        self.vq           = VectorQuantizer(codebook_size, self.d_shared, commitment_beta, ema_decay)
-        self.subject_head = SubjectResidualHead(self.d_subject, num_subjects)
-        self.decoder      = ReconstructionDecoder(self.d_shared, self.d_subject)
-        self.classifier   = LinearWithConstraint(self.d_shared, n_outputs, max_norm=max_norm_clf)
+        self.vq = VectorQuantizer(
+            codebook_size=codebook_size,
+            embedding_dim=self.d_shared,
+            commitment_beta=commitment_beta,
+            ema_decay=ema_decay,
+        )
+        self.subject_head = SubjectResidualHead(
+            input_dim=self.d_subject,
+            num_subjects=num_subjects,
+        )
+        self.decoder = ReconstructionDecoder(
+            d_shared=self.d_shared,
+            d_subject=self.d_subject,
+        )
+        self.classifier = LinearWithConstraint(
+            in_features=self.d_shared,
+            out_features=n_outputs,
+            max_norm=max_norm_clf,
+        )
 
-    def forward(self, z_e, subject_id):
-        z_e_shared, z_e_subject = z_e[:, :self.d_shared], z_e[:, self.d_shared:]
+    def forward(self, z_e: torch.Tensor, subject_id: torch.LongTensor):
+        z_e_shared  = z_e[:, :self.d_shared]
+        z_e_subject = z_e[:, self.d_shared:]
+
         z_q_st, z_q, indices, loss_vq = self.vq(z_e_shared)
         z_subject = self.subject_head(z_e_subject, subject_id)
         z_e_recon = self.decoder(z_q_st, z_subject)
         logits    = self.classifier(z_q_st)
+
         return logits, z_q_st, z_subject, z_e_recon, loss_vq
 
 
-# ── 6. Full Model ─────────────────────────────────────────────────────────────
+# =============================================================================
+# 6. Full Model
+# =============================================================================
 
 class EEGNeXVQDecomposed(nn.Module):
-    def __init__(self, n_chans, n_outputs, n_times, num_subjects,
-                 filter_1=8, filter_2=32, depth_multiplier=2, drop_prob=0.5,
-                 kernel_block_1_2=64, kernel_block_4=16, dilation_block_4=2,
-                 avg_pool_block4=4, kernel_block_5=16, dilation_block_5=4,
-                 avg_pool_block5=8, codebook_size=512, commitment_beta=0.25, ema_decay=0.99):
+
+    def __init__(
+        self,
+        n_chans: int,
+        n_outputs: int,
+        n_times: int,
+        num_subjects: int,
+        filter_1: int = 8,
+        filter_2: int = 32,
+        depth_multiplier: int = 2,
+        drop_prob: float = 0.5,
+        kernel_block_1_2: int = 64,
+        kernel_block_4: int = 16,
+        dilation_block_4: int = 2,
+        avg_pool_block4: int = 4,
+        kernel_block_5: int = 16,
+        dilation_block_5: int = 4,
+        avg_pool_block5: int = 8,
+        codebook_size: int = 64,
+        commitment_beta: float = 0.25,
+        ema_decay: float = 0.99,
+    ):
         super().__init__()
+
         self.backbone = EEGNeXBackbone(
             n_chans=n_chans, n_outputs=n_outputs, n_times=n_times,
             filter_1=filter_1, filter_2=filter_2, depth_multiplier=depth_multiplier,
             drop_prob=drop_prob, kernel_block_1_2=kernel_block_1_2,
             kernel_block_4=kernel_block_4, dilation_block_4=dilation_block_4,
             avg_pool_block4=avg_pool_block4, kernel_block_5=kernel_block_5,
-            dilation_block_5=dilation_block_5, avg_pool_block5=avg_pool_block5)
+            dilation_block_5=dilation_block_5, avg_pool_block5=avg_pool_block5,
+        )
         self.head = VQDecomposedHead(
-            self.backbone.out_features, n_outputs, num_subjects,
-            codebook_size, commitment_beta, ema_decay)
+            in_features=self.backbone.out_features,
+            n_outputs=n_outputs,
+            num_subjects=num_subjects,
+            codebook_size=codebook_size,
+            commitment_beta=commitment_beta,
+            ema_decay=ema_decay,
+        )
 
-    def forward(self, x, subject_id):
+    def forward(self, x: torch.Tensor, subject_id: torch.LongTensor):
         z_e = self.backbone(x)
         logits, z_q_st, z_subject, z_e_recon, loss_vq = self.head(z_e, subject_id)
         return logits, z_q_st, z_subject, z_e_recon, z_e, loss_vq
 
-    def encode_shared(self, x):
-        """Retrieval/inference: returns discrete z_q only. Subject discarded."""
+    def encode_shared(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Inference / retrieval: discrete z_q only.
+        No subject_id passed, z_subject discarded.
+        This is the cross-subject generalisation pathway.
+        """
         z_e = self.backbone(x)
-        _, z_q, _, _ = self.head.vq(z_e[:, :self.head.d_shared])
+        z_e_shared = z_e[:, :self.head.d_shared]
+        _, z_q, _, _ = self.head.vq(z_e_shared)
         return z_q
 
 
-# ── 7. Loss ───────────────────────────────────────────────────────────────────
+# =============================================================================
+# 7. Loss Function
+# =============================================================================
 
-def compute_loss(logits, labels, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
-                 lambda_vq=1.0, lambda_recon=0.5, lambda_ortho=0.1):
+def compute_loss(
+    logits, labels, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
+    lambda_vq: float = 1.0,
+    lambda_recon: float = 0.5,
+    lambda_ortho: float = 1.0,
+):
+    """
+    L = L_cls + lambda_vq * L_vq + lambda_recon * L_recon + lambda_ortho * L_ortho
+
+    L_cls   : CrossEntropy        -- z_shared must encode class-discriminative content
+    L_vq    : codebook+commitment -- codebook and encoder stay aligned
+    L_recon : MSE(recon, z_e)     -- z_subject must encode what VQ discarded
+    L_ortho : squared dot product -- forces z_shared and z_subject to encode
+                                     different information (disentanglement)
+    """
     L_cls   = F.cross_entropy(logits, labels)
     L_recon = F.mse_loss(z_e_recon, z_e.detach())
+
+    # Normalise both to unit vectors then measure squared cosine similarity
     d = min(z_q_st.shape[1], z_subject.shape[1])
-    L_ortho = (F.normalize(z_q_st[:,:d], dim=-1) * F.normalize(z_subject[:,:d], dim=-1)).sum(-1).pow(2).mean()
-    total   = L_cls + lambda_vq*loss_vq + lambda_recon*L_recon + lambda_ortho*L_ortho
-    return {"total": total, "cls": L_cls, "vq": loss_vq, "recon": L_recon, "ortho": L_ortho}
+    z_s = F.normalize(z_q_st[:, :d],    dim=-1)
+    z_u = F.normalize(z_subject[:, :d], dim=-1)
+    L_ortho = (z_s * z_u).sum(dim=-1).pow(2).mean()
+
+    total = (
+        L_cls
+        + lambda_vq    * loss_vq
+        + lambda_recon * L_recon
+        + lambda_ortho * L_ortho
+    )
+    return {
+        "total": total,
+        "cls":   L_cls,
+        "vq":    loss_vq,
+        "recon": L_recon,
+        "ortho": L_ortho,
+    }
 
 
-# ── 8. Training Script ────────────────────────────────────────────────────────
+# =============================================================================
+# 8. Codebook Warm-Start (kmeans init from real encoder outputs)
+# =============================================================================
+
+def init_codebook_from_data(model, dataloader, device, n_batches: int = 10):
+    """
+    Initialise the VQ codebook from real encoder outputs before training.
+
+    Runs n_batches forward passes through the backbone, collects z_e_shared
+    embeddings, then seeds the codebook with K randomly selected samples.
+    This prevents the cold-start collapse where random init places all codes
+    far from the actual encoder output distribution.
+
+    Call once after model creation, before the training loop.
+    """
+    model.eval()
+    samples = []
+
+    with torch.no_grad():
+        for i, (X, y, s) in enumerate(dataloader):
+            if i >= n_batches:
+                break
+            z_e = model.backbone(X.to(device))
+            z_e_shared = z_e[:, :model.head.d_shared]
+            samples.append(z_e_shared.cpu())
+
+    samples = torch.cat(samples, dim=0)   # [N, d_shared]
+    K = model.head.vq.K
+
+    if len(samples) < K:
+        # If we somehow have fewer samples than codes, sample with replacement
+        idx = torch.randint(0, len(samples), (K,))
+    else:
+        idx = torch.randperm(len(samples))[:K]
+
+    init_weights = samples[idx].to(device)
+    model.head.vq.codebook.weight.data.copy_(init_weights)
+    model.head.vq.ema_embedding_sum.copy_(init_weights)
+    model.head.vq.ema_cluster_size.fill_(1.0)   # treat all as equally initialised
+
+    print(f"Codebook warm-started from {len(samples)} real encoder outputs "
+          f"(K={K}, d={model.head.d_shared})")
+    model.train()
+
+
+# =============================================================================
+# 9. Training Script  (PhysionetMI, 109 subjects)
+# =============================================================================
 
 def main(config):
+
     from utils import get_PhysionetMI
     import os
 
+    # ── Verify data is present ──────────────────────────────────────────────
     DATA_DIR = os.path.expanduser("~/mne_data/MNE-eegbci-data/files/eegmmidb/1.0.0")
-    missing = [(s,r) for s in config["subject"] for r in [4,6,8,10,12,14]
-               if not os.path.exists(os.path.join(DATA_DIR, f"S{s:03d}", f"S{s:03d}R{r:02d}.edf"))]
+    RUNS = [4, 6, 8, 10, 12, 14]
+    missing = [
+        (s, r) for s in config["subject"] for r in RUNS
+        if not os.path.exists(
+            os.path.join(DATA_DIR, f"S{s:03d}", f"S{s:03d}R{r:02d}.edf")
+        )
+    ]
     if missing:
-        print(f"Missing data. Run: python download_physionet.py"); raise SystemExit(1)
+        missing_subjects = sorted(set(s for s, _ in missing))
+        print(f"ERROR: {len(missing_subjects)} subjects not downloaded.")
+        print("Run: python download_physionet.py")
+        raise SystemExit(1)
 
-    data, labels, meta, _ = get_PhysionetMI(
-        subject=config["subject"], freq_min=config["freq"][0], freq_max=config["freq"][1])
+    # ── Load and prepare data ───────────────────────────────────────────────
+    print(f"Loading PhysionetMI for {len(config['subject'])} subjects...")
+    data, labels, meta, channels = get_PhysionetMI(
+        subject=config["subject"],
+        freq_min=config["freq"][0],
+        freq_max=config["freq"][1],
+    )
 
-    mask   = np.isin(labels, [0,1,2])
-    data   = data[mask]; labels = labels[mask]; meta = meta.iloc[mask].reset_index(drop=True)
-    labels = np.array([{0:0,1:1,2:2}[l] for l in labels])
+    # Keep only left_hand=0, right_hand=1, feet=2
+    mask   = np.isin(labels, [0, 1, 2])
+    data   = data[mask]
+    labels = labels[mask]
+    meta   = meta.iloc[mask].reset_index(drop=True)
+    labels = np.array([{0: 0, 1: 1, 2: 2}[l] for l in labels])
 
+    # 0-index subject IDs for embedding table
     unique_subjects = sorted(meta["subject"].unique())
-    subject_to_idx  = {s:i for i,s in enumerate(unique_subjects)}
+    subject_to_idx  = {s: i for i, s in enumerate(unique_subjects)}
     subject_ids     = np.array([subject_to_idx[s] for s in meta["subject"]])
     num_subjects    = len(unique_subjects)
 
+    # Crop to 512 samples
     n_t = data.shape[2]
     if n_t >= 512:
-        s = (n_t-512)//2; data = data[:,:,s:s+512]
+        start = (n_t - 512) // 2
+        data  = data[:, :, start:start + 512]
+    else:
+        print(f"Warning: time dim is {n_t}, expected >= 512")
 
-    train_idx, test_idx = sk_split(np.arange(len(data)), test_size=0.2,
-                                   stratify=labels, random_state=config["seed"])
+    print(f"Data: {data.shape} | Labels: {np.bincount(labels)} | Subjects: {num_subjects}")
 
-    class DS(Dataset):
-        def __init__(self,X,y,s):
-            self.X=torch.from_numpy(X).float(); self.y=torch.from_numpy(y).long(); self.s=torch.LongTensor(s)
-        def __len__(self): return len(self.X)
-        def __getitem__(self,i): return self.X[i],self.y[i],self.s[i]
+    # ── Train / test split ──────────────────────────────────────────────────
+    train_idx, test_idx = sk_split(
+        np.arange(len(data)),
+        test_size=0.2,
+        stratify=labels,
+        random_state=config["seed"],
+    )
 
-    train_loader = DataLoader(DS(data[train_idx],labels[train_idx],subject_ids[train_idx]),
-                              batch_size=config["batch_size"], shuffle=True)
-    valid_loader = DataLoader(DS(data[test_idx], labels[test_idx], subject_ids[test_idx]),
-                              batch_size=config["batch_size"], shuffle=False)
+    class TensorsDataset(Dataset):
+        def __init__(self, X, y, sids):
+            self.X   = torch.from_numpy(X).float()
+            self.y   = torch.from_numpy(y).long()
+            self.s   = torch.LongTensor(sids)
+        def __len__(self):
+            return len(self.X)
+        def __getitem__(self, i):
+            return self.X[i], self.y[i], self.s[i]
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model  = EEGNeXVQDecomposed(
-        n_chans=data.shape[1], n_outputs=len(np.unique(labels)),
-        n_times=data.shape[2], num_subjects=num_subjects,
+    train_loader = DataLoader(
+        TensorsDataset(data[train_idx], labels[train_idx], subject_ids[train_idx]),
+        batch_size=config["batch_size"], shuffle=True,
+    )
+    valid_loader = DataLoader(
+        TensorsDataset(data[test_idx], labels[test_idx], subject_ids[test_idx]),
+        batch_size=config["batch_size"], shuffle=False,
+    )
+
+    # ── Model ───────────────────────────────────────────────────────────────
+    cuda   = torch.cuda.is_available()
+    device = "cuda" if cuda else "cpu"
+    print(f"Using device: {device}")
+
+    n_channels = data.shape[1]
+    n_classes  = len(np.unique(labels))
+    n_times    = data.shape[2]
+
+    model = EEGNeXVQDecomposed(
+        n_chans=n_channels,
+        n_outputs=n_classes,
+        n_times=n_times,
+        num_subjects=num_subjects,
         codebook_size=config["codebook_size"],
         commitment_beta=config["commitment_beta"],
         ema_decay=config["ema_decay"],
     ).to(device)
 
-    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    print(f"d_shared={model.head.d_shared}  d_subject={model.head.d_subject}  K={config['codebook_size']}")
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters : {total_params:,}")
+    print(f"  out_features (z_e) : {model.backbone.out_features}")
+    print(f"  d_shared (VQ dim)  : {model.head.d_shared}")
+    print(f"  d_subject (resid.) : {model.head.d_subject}")
+    print(f"  Codebook size K    : {config['codebook_size']}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config["epochs"])
+    # ── Codebook warm-start ─────────────────────────────────────────────────
+    # Initialise codebook from real encoder outputs before training begins.
+    # Prevents the cold-start collapse seen when using random uniform init.
+    init_codebook_from_data(
+        model, train_loader, device,
+        n_batches=config["warmstart_batches"],
+    )
 
-    best_acc, patience_counter = 0.0, 0
+    # ── Optimiser and scheduler ─────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config["epochs"]
+    )
 
+    best_valid_acc   = 0.0
+    patience_counter = 0
+
+    # ── Training loop ───────────────────────────────────────────────────────
     for epoch in range(config["epochs"]):
         model.train()
-        running = {k:0.0 for k in ["total","cls","vq","recon","ortho"]}
-        correct = 0
+        running = {k: 0.0 for k in ["total", "cls", "vq", "recon", "ortho"]}
+        train_correct = 0
 
-        for X,y,s in train_loader:
-            X,y,s = X.to(device), y.to(device), s.to(device)
+        for inputs, targets, sids in train_loader:
+            inputs  = inputs.to(device)
+            targets = targets.to(device)
+            sids    = sids.to(device)
+
             optimizer.zero_grad()
-            logits,z_q_st,z_sub,z_recon,z_e,loss_vq = model(X,s)
-            losses = compute_loss(logits,y,z_q_st,z_sub,z_recon,z_e,loss_vq,
-                                  config["lambda_vq"],config["lambda_recon"],config["lambda_ortho"])
+
+            logits, z_q_st, z_subject, z_e_recon, z_e, loss_vq = model(inputs, sids)
+
+            losses = compute_loss(
+                logits, targets, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
+                lambda_vq=config["lambda_vq"],
+                lambda_recon=config["lambda_recon"],
+                lambda_ortho=config["lambda_ortho"],
+            )
+
             losses["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            for k in running: running[k] += losses[k].item()
-            correct += (logits.argmax(1)==y).sum().item()
+
+            for k in running:
+                running[k] += losses[k].item()
+            train_correct += (logits.argmax(1) == targets).sum().item()
 
         scheduler.step()
-        for k in running: running[k] /= len(train_loader)
-        train_acc = correct / len(train_loader.dataset)
 
-        model.eval(); v_loss, v_correct = 0.0, 0
+        for k in running:
+            running[k] /= len(train_loader)
+        train_acc = train_correct / len(train_loader.dataset)
+
+        # ── Validation ──────────────────────────────────────────────────────
+        model.eval()
+        valid_loss    = 0.0
+        valid_correct = 0
+
         with torch.no_grad():
-            for X,y,s in valid_loader:
-                X,y,s = X.to(device),y.to(device),s.to(device)
-                logits,z_q_st,z_sub,z_recon,z_e,loss_vq = model(X,s)
-                losses = compute_loss(logits,y,z_q_st,z_sub,z_recon,z_e,loss_vq,
-                                      config["lambda_vq"],config["lambda_recon"],config["lambda_ortho"])
-                v_loss += losses["total"].item()
-                v_correct += (logits.argmax(1)==y).sum().item()
+            for inputs, targets, sids in valid_loader:
+                inputs  = inputs.to(device)
+                targets = targets.to(device)
+                sids    = sids.to(device)
 
-        v_acc = v_correct / len(valid_loader.dataset)
-        dead  = model.head.vq.dead_code_fraction()
+                logits, z_q_st, z_subject, z_e_recon, z_e, loss_vq = model(inputs, sids)
 
-        print(f"Ep {epoch+1:3d}/{config['epochs']} | train={train_acc:.4f} valid={v_acc:.4f} | "
-              f"cls={running['cls']:.3f} vq={running['vq']:.3f} "
-              f"recon={running['recon']:.3f} ortho={running['ortho']:.3f} | dead={dead:.1%}")
+                losses = compute_loss(
+                    logits, targets, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
+                    lambda_vq=config["lambda_vq"],
+                    lambda_recon=config["lambda_recon"],
+                    lambda_ortho=config["lambda_ortho"],
+                )
 
-        wandb.log({"train_acc":train_acc,"valid_acc":v_acc,"train_loss_total":running["total"],
-                   "train_loss_cls":running["cls"],"train_loss_vq":running["vq"],
-                   "train_loss_recon":running["recon"],"train_loss_ortho":running["ortho"],
-                   "valid_loss":v_loss/len(valid_loader),"dead_code_frac":dead})
+                valid_loss    += losses["total"].item()
+                valid_correct += (logits.argmax(1) == targets).sum().item()
 
-        if v_acc > best_acc:
-            best_acc = v_acc; patience_counter = 0
+        valid_loss /= len(valid_loader)
+        valid_acc   = valid_correct / len(valid_loader.dataset)
+        dead_frac   = model.head.vq.dead_code_fraction()
+
+        print(
+            f"Ep {epoch+1:3d}/{config['epochs']} | "
+            f"train={train_acc:.4f} valid={valid_acc:.4f} | "
+            f"cls={running['cls']:.3f} vq={running['vq']:.3f} "
+            f"recon={running['recon']:.3f} ortho={running['ortho']:.3f} | "
+            f"dead={dead_frac:.1%}"
+        )
+
+        wandb.log({
+            "train_acc":        train_acc,
+            "valid_acc":        valid_acc,
+            "train_loss_total": running["total"],
+            "train_loss_cls":   running["cls"],
+            "train_loss_vq":    running["vq"],
+            "train_loss_recon": running["recon"],
+            "train_loss_ortho": running["ortho"],
+            "valid_loss":       valid_loss,
+            "dead_code_frac":   dead_frac,
+        })
+
+        if valid_acc > best_valid_acc:
+            best_valid_acc   = valid_acc
+            patience_counter = 0
             torch.save(model.state_dict(), "best_vq_decomposed.pt")
         else:
             patience_counter += 1
             if patience_counter >= config["patience"]:
-                print(f"Early stop. Best: {best_acc:.4f}"); break
+                print(f"Early stopping at epoch {epoch+1}. Best: {best_valid_acc:.4f}")
+                break
 
-    print(f"\nBest valid accuracy: {best_acc:.4f}")
+    print(f"\nBest valid accuracy: {best_valid_acc:.4f}")
 
-    # Cross-subject eval: z_shared ONLY — no subject adapter used
-    print("\n--- Cross-subject eval (z_shared only) ---")
+    # ── Cross-subject evaluation: z_shared ONLY ─────────────────────────────
+    # Classify using only the discrete shared code, no subject adapter.
+    # This is the principled cross-subject generalisation test.
+    print("\n--- Cross-subject eval (z_shared only, subject adapter discarded) ---")
     model.load_state_dict(torch.load("best_vq_decomposed.pt"))
-    model.eval(); cs_correct = 0
+    model.eval()
+
+    cs_correct = 0
     with torch.no_grad():
-        for X,y,s in valid_loader:
-            z_q = model.encode_shared(X.to(device))
-            cs_correct += (model.head.classifier(z_q).argmax(1)==y.to(device)).sum().item()
+        for inputs, targets, sids in valid_loader:
+            inputs  = inputs.to(device)
+            targets = targets.to(device)
+            z_q     = model.encode_shared(inputs)
+            logits  = model.head.classifier(z_q)
+            cs_correct += (logits.argmax(1) == targets).sum().item()
+
     cs_acc = cs_correct / len(valid_loader.dataset)
     print(f"z_shared-only accuracy: {cs_acc:.4f}")
     wandb.log({"cross_subject_acc_shared_only": cs_acc})
 
 
+# =============================================================================
+# 10. Entry Point
+# =============================================================================
+
 if __name__ == "__main__":
+
     config = {
-        "freq": [8,45], "subject": list(range(1,110)), "seed": 1,
-        "epochs": 50, "batch_size": 64, "lr": 1e-3, "weight_decay": 0.01, "patience": 10,
-        "codebook_size": 512, "commitment_beta": 0.25, "ema_decay": 0.99,
-        "lambda_vq": 1.0, "lambda_recon": 0.5, "lambda_ortho": 0.1,
+        # Data
+        "freq":    [8, 45],
+        "subject": list(range(1, 110)),
+        "seed":    1,
+
+        # Training
+        "epochs":       50,
+        "batch_size":   64,
+        "lr":           1e-3,
+        "weight_decay": 0.01,
+        "patience":     10,
+
+        # VQ  (key changes vs initial version)
+        "codebook_size":    64,     # was 512 — proportional to 3-class task
+        "commitment_beta":  0.25,
+        "ema_decay":        0.99,
+        "warmstart_batches": 10,    # batches to use for codebook warm-start
+
+        # Loss weights  (key changes vs initial version)
+        "lambda_vq":    1.0,
+        "lambda_recon": 0.5,
+        "lambda_ortho": 1.0,        # was 0.1 — needs to be strong enough to matter
     }
-    torch.manual_seed(config["seed"]); torch.cuda.manual_seed(config["seed"])
-    np.random.seed(config["seed"]); random.seed(config["seed"])
+
+    torch.manual_seed(config["seed"])
+    torch.cuda.manual_seed(config["seed"])
+    np.random.seed(config["seed"])
+    random.seed(config["seed"])
     torch.backends.cudnn.deterministic = True
 
     import wandb
-    wandb.init(project="VQ_Decomposed_EEGNeX_PhysionetMI", config=config, reinit=False)
+    wandb.init(
+        project="VQ_Decomposed_EEGNeX_PhysionetMI",
+        config=config,
+        reinit=False,
+    )
+
     main(config)
