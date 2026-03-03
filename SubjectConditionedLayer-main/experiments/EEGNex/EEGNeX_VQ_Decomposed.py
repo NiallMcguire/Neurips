@@ -1,12 +1,18 @@
-# EEGNeX with Decomposed VQ Latent Space
+# EEGNeX with Decomposed VQ Latent Space  — v5
 # ============================================================
-# z_shared  -- discrete VQ code, shared across subjects
+# z_shared  -- VQ-regularised continuous representation, shared across subjects
 # z_subject -- continuous subject residual
 #
-# Changes vs v3:
-#   1. filter_1          8    -> 16   (doubles d_shared: 64 -> 128)
-#   2. dead_mask         <1.0 -> <0.1 (less aggressive restart, allows stabilisation)
-#   3. lambda_vq         2.0  -> 1.0  (reduced now backbone is larger)
+# Changes vs v4:
+#   1. Classifier acts on continuous z_e_shared (not z_q_st)
+#      VQ is now a structural regulariser, not a bottleneck
+#      Classification gradients flow cleanly to encoder
+#   2. Gumbel-Softmax replaces hard argmin in VQ
+#      Differentiable soft assignment annealed toward hard over training
+#   3. Class-coherent codebook loss (L_coherence)
+#      Explicitly encourages same-class samples to use similar codes
+#   4. lambda_vq reduced to 0.5 (VQ is regulariser not primary objective)
+#   5. lambda_coherence = 0.5 (new loss term)
 # ============================================================
 
 import math
@@ -24,19 +30,26 @@ from braindecode.modules import Conv2dWithConstraint, LinearWithConstraint
 
 
 # =============================================================================
-# 1. Vector Quantizer
+# 1. Vector Quantizer  (Gumbel-Softmax, temperature annealed)
 # =============================================================================
 
 class VectorQuantizer(nn.Module):
     """
-    Nearest-neighbour lookup into a learned codebook.
+    Codebook lookup with Gumbel-Softmax for differentiable assignment.
 
-    Key mechanisms:
-      - Straight-through estimator for differentiability
-      - EMA codebook updates (Van den Oord et al. Appendix A)
-      - Laplace smoothing to resist dead codes
-      - Dead code restart with threshold 0.1 — allows codes to accumulate
-        stable statistics before being recycled, preventing churn
+    Training:
+        Soft weighted sum over codebook entries via Gumbel-Softmax.
+        Temperature annealed from temp_start -> temp_end over training.
+        As temperature -> 0 this recovers hard argmin.
+
+    Inference / retrieval:
+        Hard argmin over distances, returns nearest codebook entry.
+
+    The VQ loss (codebook + commitment) acts as a regulariser that
+    forces z_e_shared to organise into discrete clusters.  Classification
+    now bypasses this entirely by acting on the continuous z_e_shared.
+
+    EMA codebook updates + dead code restart with threshold 0.1.
     """
 
     def __init__(
@@ -45,12 +58,17 @@ class VectorQuantizer(nn.Module):
         embedding_dim: int = 128,
         commitment_beta: float = 0.25,
         ema_decay: float = 0.95,
+        temp_start: float = 1.0,
+        temp_end: float = 0.1,
     ):
         super().__init__()
-        self.K = codebook_size
-        self.d = embedding_dim
-        self.beta = commitment_beta
-        self.ema_decay = ema_decay
+        self.K          = codebook_size
+        self.d          = embedding_dim
+        self.beta       = commitment_beta
+        self.ema_decay  = ema_decay
+        self.temp_start = temp_start
+        self.temp_end   = temp_end
+        self.temperature = temp_start   # updated externally each epoch
 
         self.codebook = nn.Embedding(self.K, self.d)
         nn.init.uniform_(self.codebook.weight, -1.0 / self.K, 1.0 / self.K)
@@ -61,30 +79,39 @@ class VectorQuantizer(nn.Module):
     def forward(self, z_e: torch.Tensor):
         """
         Args:
-            z_e : [batch, d]  continuous encoder output (shared half)
+            z_e : [B, d]  continuous encoder output (shared half)
 
         Returns:
-            z_q_st  : [batch, d]  straight-through quantized vector
-            z_q     : [batch, d]  hard quantized (no encoder gradient)
-            indices : [batch]     codebook indices
-            loss_vq : scalar      codebook + commitment loss
+            z_q_soft : [B, d]  soft weighted codebook vector (training)
+                               hard nearest codebook vector (eval)
+            z_q_hard : [B, d]  hard nearest codebook vector (always)
+            indices  : [B]     hard assignment indices
+            weights  : [B, K]  soft assignment weights (for coherence loss)
+            loss_vq  : scalar  codebook + commitment loss
         """
-        # Pairwise squared L2 distances to all K codebook entries
+        # Pairwise squared L2 distances  [B, K]
         dists = (
             z_e.pow(2).sum(dim=1, keepdim=True)
             - 2 * (z_e @ self.codebook.weight.t())
             + self.codebook.weight.pow(2).sum(dim=1)
         )
 
-        indices = dists.argmin(dim=1)
-        z_q = self.codebook(indices)
+        # Hard assignment (always computed for EMA and inference)
+        indices  = dists.argmin(dim=1)                 # [B]
+        z_q_hard = self.codebook(indices)              # [B, d]
 
-        # EMA codebook update (training only)
         if self.training:
+            # Gumbel-Softmax soft assignment
+            # Negative distances as logits (closer = higher logit)
+            logits_vq = -dists / self.temperature              # [B, K]
+            weights   = F.softmax(logits_vq, dim=1)           # [B, K]
+            z_q_soft  = weights @ self.codebook.weight         # [B, d]
+
+            # EMA codebook update using hard assignments
             with torch.no_grad():
-                one_hot = F.one_hot(indices, self.K).float()          # [B, K]
-                new_cluster_size  = one_hot.sum(0)                    # [K]
-                new_embedding_sum = one_hot.t() @ z_e                 # [K, d]
+                one_hot = F.one_hot(indices, self.K).float()   # [B, K]
+                new_cluster_size  = one_hot.sum(0)             # [K]
+                new_embedding_sum = one_hot.t() @ z_e          # [K, d]
 
                 self.ema_cluster_size.mul_(self.ema_decay).add_(
                     new_cluster_size * (1 - self.ema_decay)
@@ -104,10 +131,7 @@ class VectorQuantizer(nn.Module):
                     self.ema_embedding_sum / smoothed.unsqueeze(1)
                 )
 
-                # ── Dead code restart ────────────────────────────────────────
-                # Threshold 0.1 (was 1.0) — codes must be near-completely unused
-                # before being recycled. Prevents churn where active codes get
-                # wiped before building stable statistics.
+                # Dead code restart — threshold 0.1 allows codes to stabilise
                 dead_mask = self.ema_cluster_size < 0.1
                 n_dead = dead_mask.sum().item()
                 if n_dead > 0:
@@ -115,19 +139,25 @@ class VectorQuantizer(nn.Module):
                         0, z_e.shape[0], (n_dead,), device=z_e.device
                     )
                     self.codebook.weight.data[dead_mask] = z_e[rand_idx].detach()
-                    self.ema_cluster_size[dead_mask] = 1.0
-                    self.ema_embedding_sum[dead_mask] = z_e[rand_idx].detach()
-                # ─────────────────────────────────────────────────────────────
+                    self.ema_cluster_size[dead_mask]     = 1.0
+                    self.ema_embedding_sum[dead_mask]    = z_e[rand_idx].detach()
 
-        # VQ losses
-        loss_codebook = F.mse_loss(z_q, z_e.detach())
-        loss_commit   = F.mse_loss(z_e, z_q.detach())
+        else:
+            # Inference: hard assignment, uniform weights for compatibility
+            z_q_soft = z_q_hard
+            weights  = F.one_hot(indices, self.K).float()
+
+        # VQ losses computed against hard assignment
+        loss_codebook = F.mse_loss(z_q_hard, z_e.detach())
+        loss_commit   = F.mse_loss(z_e, z_q_hard.detach())
         loss_vq       = loss_codebook + self.beta * loss_commit
 
-        # Straight-through estimator
-        z_q_st = z_e + (z_q - z_e).detach()
+        return z_q_soft, z_q_hard, indices, weights, loss_vq
 
-        return z_q_st, z_q, indices, loss_vq
+    def set_temperature(self, epoch: int, total_epochs: int):
+        """Anneal temperature linearly from temp_start to temp_end."""
+        frac = epoch / max(total_epochs - 1, 1)
+        self.temperature = self.temp_start + frac * (self.temp_end - self.temp_start)
 
     def dead_code_fraction(self) -> float:
         return (self.ema_cluster_size < 1.0).float().mean().item()
@@ -140,7 +170,8 @@ class VectorQuantizer(nn.Module):
 class SubjectResidualHead(nn.Module):
     """
     Per-subject embedding bias injected before a shared MLP.
-    Encodes individual variation that the shared VQ code cannot represent.
+    Encodes individual variation that the shared VQ-regularised
+    representation cannot and should not represent.
     """
 
     def __init__(self, input_dim: int, num_subjects: int, hidden_dim: int = None):
@@ -168,7 +199,7 @@ class SubjectResidualHead(nn.Module):
 
 class ReconstructionDecoder(nn.Module):
     """
-    Reconstructs z_e from (z_shared, z_subject).
+    Reconstructs z_e from (z_q_soft, z_subject).
     Forces z_subject to encode whatever individual variation VQ discarded.
     Target is z_e.detach() so reconstruction gradients do not perturb encoder.
     """
@@ -183,8 +214,8 @@ class ReconstructionDecoder(nn.Module):
             nn.Linear(in_dim * 2, in_dim),
         )
 
-    def forward(self, z_shared_st: torch.Tensor, z_subject: torch.Tensor):
-        return self.decoder(torch.cat([z_shared_st, z_subject], dim=-1))
+    def forward(self, z_q_soft: torch.Tensor, z_subject: torch.Tensor):
+        return self.decoder(torch.cat([z_q_soft, z_subject], dim=-1))
 
 
 # =============================================================================
@@ -194,11 +225,7 @@ class ReconstructionDecoder(nn.Module):
 class EEGNeXBackbone(EEGModuleMixin, nn.Module):
     """
     Standard EEGNeX convolutional encoder shared across all subjects.
-    No subject-specific parameters anywhere in this module.
-    Outputs flat embedding [batch, out_features].
-
-    filter_1=16 gives out_features=256, d_shared=128 — double the previous
-    capacity which was too tight for the VQ bottleneck to learn from.
+    filter_1=16 gives out_features=256, d_shared=128.
     """
 
     def __init__(
@@ -294,8 +321,12 @@ class EEGNeXBackbone(EEGModuleMixin, nn.Module):
 
 class VQDecomposedHead(nn.Module):
     """
-    Splits z_e into shared (VQ) and subject (residual) components.
-    Classifies from z_shared only. Reconstructs z_e from both.
+    Splits z_e into shared and subject components.
+
+    Key change vs v4:
+        Classifier now acts on continuous z_e_shared directly.
+        VQ provides structural regularisation on z_e_shared, not a bottleneck.
+        Clean gradient path: L_cls -> classifier -> z_e_shared -> encoder.
     """
 
     def __init__(
@@ -306,6 +337,8 @@ class VQDecomposedHead(nn.Module):
         codebook_size: int = 64,
         commitment_beta: float = 0.25,
         ema_decay: float = 0.95,
+        temp_start: float = 1.0,
+        temp_end: float = 0.1,
         max_norm_clf: float = 0.25,
     ):
         super().__init__()
@@ -317,6 +350,8 @@ class VQDecomposedHead(nn.Module):
             embedding_dim=self.d_shared,
             commitment_beta=commitment_beta,
             ema_decay=ema_decay,
+            temp_start=temp_start,
+            temp_end=temp_end,
         )
         self.subject_head = SubjectResidualHead(
             input_dim=self.d_subject,
@@ -326,6 +361,7 @@ class VQDecomposedHead(nn.Module):
             d_shared=self.d_shared,
             d_subject=self.d_subject,
         )
+        # Classifier acts on continuous z_e_shared — not z_q_st
         self.classifier = LinearWithConstraint(
             in_features=self.d_shared,
             out_features=n_outputs,
@@ -336,12 +372,14 @@ class VQDecomposedHead(nn.Module):
         z_e_shared  = z_e[:, :self.d_shared]
         z_e_subject = z_e[:, self.d_shared:]
 
-        z_q_st, z_q, indices, loss_vq = self.vq(z_e_shared)
+        z_q_soft, z_q_hard, indices, weights, loss_vq = self.vq(z_e_shared)
         z_subject = self.subject_head(z_e_subject, subject_id)
-        z_e_recon = self.decoder(z_q_st, z_subject)
-        logits    = self.classifier(z_q_st)
+        z_e_recon = self.decoder(z_q_soft, z_subject)
 
-        return logits, z_q_st, z_subject, z_e_recon, loss_vq
+        # Clean gradient path: continuous z_e_shared -> classifier -> L_cls
+        logits = self.classifier(z_e_shared)
+
+        return logits, z_e_shared, z_q_soft, z_subject, z_e_recon, weights, loss_vq
 
 
 # =============================================================================
@@ -370,6 +408,8 @@ class EEGNeXVQDecomposed(nn.Module):
         codebook_size: int = 64,
         commitment_beta: float = 0.25,
         ema_decay: float = 0.95,
+        temp_start: float = 1.0,
+        temp_end: float = 0.1,
     ):
         super().__init__()
 
@@ -388,23 +428,28 @@ class EEGNeXVQDecomposed(nn.Module):
             codebook_size=codebook_size,
             commitment_beta=commitment_beta,
             ema_decay=ema_decay,
+            temp_start=temp_start,
+            temp_end=temp_end,
         )
 
     def forward(self, x: torch.Tensor, subject_id: torch.LongTensor):
         z_e = self.backbone(x)
-        logits, z_q_st, z_subject, z_e_recon, loss_vq = self.head(z_e, subject_id)
-        return logits, z_q_st, z_subject, z_e_recon, z_e, loss_vq
+        logits, z_e_shared, z_q_soft, z_subject, z_e_recon, weights, loss_vq = \
+            self.head(z_e, subject_id)
+        return logits, z_e_shared, z_q_soft, z_subject, z_e_recon, z_e, weights, loss_vq
 
     def encode_shared(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Inference / retrieval: returns discrete z_q only.
-        No subject_id used, z_subject discarded.
-        Cross-subject generalisation pathway.
+        Cross-subject retrieval pathway.
+        Returns hard discrete z_q — no subject_id, z_subject discarded.
         """
         z_e = self.backbone(x)
         z_e_shared = z_e[:, :self.head.d_shared]
-        _, z_q, _, _ = self.head.vq(z_e_shared)
-        return z_q
+        _, z_q_hard, _, _, _ = self.head.vq(z_e_shared)
+        return z_q_hard
+
+    def set_temperature(self, epoch: int, total_epochs: int):
+        self.head.vq.set_temperature(epoch, total_epochs)
 
 
 # =============================================================================
@@ -412,40 +457,63 @@ class EEGNeXVQDecomposed(nn.Module):
 # =============================================================================
 
 def compute_loss(
-    logits, labels, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
-    lambda_vq: float = 1.0,
-    lambda_recon: float = 0.5,
-    lambda_ortho: float = 1.0,
+    logits, labels,
+    z_e_shared, z_subject,
+    z_e_recon, z_e,
+    vq_weights, loss_vq,
+    lambda_vq: float        = 0.5,
+    lambda_recon: float     = 0.5,
+    lambda_ortho: float     = 1.0,
+    lambda_coherence: float = 0.5,
 ):
     """
-    L = L_cls + lambda_vq*L_vq + lambda_recon*L_recon + lambda_ortho*L_ortho
+    L = L_cls + lambda_vq*L_vq + lambda_recon*L_recon
+      + lambda_ortho*L_ortho + lambda_coherence*L_coherence
 
-    L_cls   : CrossEntropy        -- z_shared encodes class-discriminative content
-    L_vq    : codebook+commitment -- encoder and codebook stay aligned
-    L_recon : MSE(recon, z_e)     -- z_subject encodes what VQ discarded
-    L_ortho : squared dot product -- forces z_shared and z_subject to encode
-                                     different information (disentanglement)
+    L_cls       : CrossEntropy on continuous z_e_shared
+                  clean gradient to encoder, no VQ wall
+    L_vq        : codebook+commitment regulariser
+                  forces z_e_shared to organise into discrete clusters
+    L_recon     : MSE(recon, z_e) — z_subject encodes what VQ discarded
+    L_ortho     : squared cosine similarity between z_e_shared and z_subject
+                  enforces disentanglement
+    L_coherence : within-class variance of VQ soft assignment weights
+                  explicitly encourages same-class samples to use same codes
     """
     L_cls   = F.cross_entropy(logits, labels)
     L_recon = F.mse_loss(z_e_recon, z_e.detach())
 
-    d = min(z_q_st.shape[1], z_subject.shape[1])
-    z_s = F.normalize(z_q_st[:, :d],    dim=-1)
-    z_u = F.normalize(z_subject[:, :d], dim=-1)
+    # Orthogonality between shared and subject components
+    d = min(z_e_shared.shape[1], z_subject.shape[1])
+    z_s = F.normalize(z_e_shared[:, :d], dim=-1)
+    z_u = F.normalize(z_subject[:, :d],  dim=-1)
     L_ortho = (z_s * z_u).sum(dim=-1).pow(2).mean()
+
+    # Class-coherent codebook: within-class variance of soft VQ weights
+    # Same-class samples should use similar codebook entries
+    n_classes   = logits.shape[1]
+    L_coherence = torch.tensor(0.0, device=logits.device)
+    for c in range(n_classes):
+        mask = labels == c
+        if mask.sum() > 1:
+            mean_w      = vq_weights[mask].mean(0, keepdim=True)   # [1, K]
+            L_coherence += (vq_weights[mask] - mean_w).pow(2).mean()
+    L_coherence = L_coherence / n_classes
 
     total = (
         L_cls
-        + lambda_vq    * loss_vq
-        + lambda_recon * L_recon
-        + lambda_ortho * L_ortho
+        + lambda_vq        * loss_vq
+        + lambda_recon     * L_recon
+        + lambda_ortho     * L_ortho
+        + lambda_coherence * L_coherence
     )
     return {
-        "total": total,
-        "cls":   L_cls,
-        "vq":    loss_vq,
-        "recon": L_recon,
-        "ortho": L_ortho,
+        "total":     total,
+        "cls":       L_cls,
+        "vq":        loss_vq,
+        "recon":     L_recon,
+        "ortho":     L_ortho,
+        "coherence": L_coherence,
     }
 
 
@@ -457,7 +525,6 @@ def init_codebook_from_data(model, dataloader, device, n_batches: int = 10):
     """
     Initialise VQ codebook from real encoder outputs before training.
     Prevents cold-start collapse from random uniform initialisation.
-    Call once after model creation, before the training loop.
     """
     model.eval()
     samples = []
@@ -582,6 +649,8 @@ def main(config):
         codebook_size=config["codebook_size"],
         commitment_beta=config["commitment_beta"],
         ema_decay=config["ema_decay"],
+        temp_start=config["temp_start"],
+        temp_end=config["temp_end"],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -607,8 +676,13 @@ def main(config):
 
     # Training loop
     for epoch in range(config["epochs"]):
+
+        # Anneal Gumbel temperature
+        model.set_temperature(epoch, config["epochs"])
+        current_temp = model.head.vq.temperature
+
         model.train()
-        running = {k: 0.0 for k in ["total", "cls", "vq", "recon", "ortho"]}
+        running = {k: 0.0 for k in ["total", "cls", "vq", "recon", "ortho", "coherence"]}
         train_correct = 0
 
         for inputs, targets, sids in train_loader:
@@ -618,13 +692,18 @@ def main(config):
 
             optimizer.zero_grad()
 
-            logits, z_q_st, z_subject, z_e_recon, z_e, loss_vq = model(inputs, sids)
+            logits, z_e_shared, z_q_soft, z_subject, z_e_recon, z_e, weights, loss_vq = \
+                model(inputs, sids)
 
             losses = compute_loss(
-                logits, targets, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
+                logits, targets,
+                z_e_shared, z_subject,
+                z_e_recon, z_e,
+                weights, loss_vq,
                 lambda_vq=config["lambda_vq"],
                 lambda_recon=config["lambda_recon"],
                 lambda_ortho=config["lambda_ortho"],
+                lambda_coherence=config["lambda_coherence"],
             )
 
             losses["total"].backward()
@@ -651,13 +730,18 @@ def main(config):
                 targets = targets.to(device)
                 sids    = sids.to(device)
 
-                logits, z_q_st, z_subject, z_e_recon, z_e, loss_vq = model(inputs, sids)
+                logits, z_e_shared, z_q_soft, z_subject, z_e_recon, z_e, weights, loss_vq = \
+                    model(inputs, sids)
 
                 losses = compute_loss(
-                    logits, targets, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
+                    logits, targets,
+                    z_e_shared, z_subject,
+                    z_e_recon, z_e,
+                    weights, loss_vq,
                     lambda_vq=config["lambda_vq"],
                     lambda_recon=config["lambda_recon"],
                     lambda_ortho=config["lambda_ortho"],
+                    lambda_coherence=config["lambda_coherence"],
                 )
 
                 valid_loss    += losses["total"].item()
@@ -671,20 +755,23 @@ def main(config):
             f"Ep {epoch+1:3d}/{config['epochs']} | "
             f"train={train_acc:.4f} valid={valid_acc:.4f} | "
             f"cls={running['cls']:.3f} vq={running['vq']:.3f} "
-            f"recon={running['recon']:.3f} ortho={running['ortho']:.3f} | "
-            f"dead={dead_frac:.1%}"
+            f"recon={running['recon']:.3f} ortho={running['ortho']:.3f} "
+            f"coh={running['coherence']:.3f} | "
+            f"dead={dead_frac:.1%} temp={current_temp:.3f}"
         )
 
         wandb.log({
-            "train_acc":        train_acc,
-            "valid_acc":        valid_acc,
-            "train_loss_total": running["total"],
-            "train_loss_cls":   running["cls"],
-            "train_loss_vq":    running["vq"],
-            "train_loss_recon": running["recon"],
-            "train_loss_ortho": running["ortho"],
-            "valid_loss":       valid_loss,
-            "dead_code_frac":   dead_frac,
+            "train_acc":           train_acc,
+            "valid_acc":           valid_acc,
+            "train_loss_total":    running["total"],
+            "train_loss_cls":      running["cls"],
+            "train_loss_vq":       running["vq"],
+            "train_loss_recon":    running["recon"],
+            "train_loss_ortho":    running["ortho"],
+            "train_loss_coherence":running["coherence"],
+            "valid_loss":          valid_loss,
+            "dead_code_frac":      dead_frac,
+            "vq_temperature":      current_temp,
         })
 
         if valid_acc > best_valid_acc:
@@ -699,23 +786,41 @@ def main(config):
 
     print(f"\nBest valid accuracy: {best_valid_acc:.4f}")
 
-    # Cross-subject evaluation: z_shared ONLY, no subject adapter
-    print("\n--- Cross-subject eval (z_shared only, subject adapter discarded) ---")
+    # Cross-subject evaluation: hard z_q only, no subject adapter
+    print("\n--- Cross-subject eval (z_q hard only, subject adapter discarded) ---")
     model.load_state_dict(torch.load("best_vq_decomposed.pt"))
     model.eval()
 
-    cs_correct = 0
+    # Also evaluate with continuous z_e_shared for comparison
+    cs_correct_hard = 0
+    cs_correct_cont = 0
+
     with torch.no_grad():
         for inputs, targets, sids in valid_loader:
             inputs  = inputs.to(device)
             targets = targets.to(device)
-            z_q    = model.encode_shared(inputs)
-            logits = model.head.classifier(z_q)
-            cs_correct += (logits.argmax(1) == targets).sum().item()
 
-    cs_acc = cs_correct / len(valid_loader.dataset)
-    print(f"z_shared-only accuracy: {cs_acc:.4f}")
-    wandb.log({"cross_subject_acc_shared_only": cs_acc})
+            # Hard discrete code (true cross-subject retrieval setting)
+            z_q_hard = model.encode_shared(inputs)
+            logits_hard = model.head.classifier(z_q_hard)
+            cs_correct_hard += (logits_hard.argmax(1) == targets).sum().item()
+
+            # Continuous shared code (upper bound for shared-only)
+            z_e = model.backbone(inputs)
+            z_e_shared = z_e[:, :model.head.d_shared]
+            logits_cont = model.head.classifier(z_e_shared)
+            cs_correct_cont += (logits_cont.argmax(1) == targets).sum().item()
+
+    cs_acc_hard = cs_correct_hard / len(valid_loader.dataset)
+    cs_acc_cont = cs_correct_cont / len(valid_loader.dataset)
+
+    print(f"z_q hard (discrete, cross-subject)  : {cs_acc_hard:.4f}")
+    print(f"z_e_shared continuous (upper bound)  : {cs_acc_cont:.4f}")
+
+    wandb.log({
+        "cross_subject_acc_discrete":   cs_acc_hard,
+        "cross_subject_acc_continuous": cs_acc_cont,
+    })
 
 
 # =============================================================================
@@ -738,18 +843,21 @@ if __name__ == "__main__":
         "patience":     10,
 
         # Backbone
-        "filter_1": 16,          # was 8 -- doubles out_features to 256, d_shared to 128
+        "filter_1": 16,
 
         # VQ
         "codebook_size":     64,
         "commitment_beta":   0.25,
         "ema_decay":         0.95,
         "warmstart_batches": 10,
+        "temp_start":        1.0,   # Gumbel temperature start
+        "temp_end":          0.1,   # Gumbel temperature end (annealed over training)
 
         # Loss weights
-        "lambda_vq":    1.0,     # was 2.0 -- reduced now backbone is larger
-        "lambda_recon": 0.5,
-        "lambda_ortho": 1.0,
+        "lambda_vq":        0.5,    # was 1.0 -- VQ is now regulariser not bottleneck
+        "lambda_recon":     0.5,
+        "lambda_ortho":     1.0,
+        "lambda_coherence": 0.5,    # new -- class-coherent codebook organisation
     }
 
     torch.manual_seed(config["seed"])
