@@ -3,11 +3,10 @@
 # z_shared  -- discrete VQ code, shared across subjects
 # z_subject -- continuous subject residual
 #
-# Fixes applied vs initial version:
-#   1. Dead code restart  -- reinitialise unused codes from real batch samples
-#   2. Codebook size      -- reduced 512 -> 64 (proportional to 3 classes)
-#   3. Kmeans warm-start  -- initialise codebook from real encoder outputs
-#   4. lambda_ortho       -- increased 0.1 -> 1.0
+# Changes vs v2:
+#   1. dead_mask threshold  0.5  -> 1.0  (more aggressive restart)
+#   2. ema_decay            0.99 -> 0.95 (faster codebook tracking)
+#   3. lambda_vq            1.0  -> 2.0  (stronger encoder-codebook coupling)
 # ============================================================
 
 import math
@@ -34,9 +33,10 @@ class VectorQuantizer(nn.Module):
 
     Key mechanisms:
       - Straight-through estimator for differentiability
-      - EMA codebook updates for stability (Van den Oord et al. Appendix A)
+      - EMA codebook updates (Van den Oord et al. Appendix A)
       - Laplace smoothing to resist dead codes
       - Dead code restart: reinitialise unused entries from real batch samples
+        Threshold raised to < 1.0 (was 0.5) for more aggressive recycling
     """
 
     def __init__(
@@ -44,7 +44,7 @@ class VectorQuantizer(nn.Module):
         codebook_size: int = 64,
         embedding_dim: int = 64,
         commitment_beta: float = 0.25,
-        ema_decay: float = 0.99,
+        ema_decay: float = 0.95,
     ):
         super().__init__()
         self.K = codebook_size
@@ -71,19 +71,19 @@ class VectorQuantizer(nn.Module):
         """
         # Pairwise squared L2 distances to all K codebook entries
         dists = (
-            z_e.pow(2).sum(dim=1, keepdim=True)          # [B, 1]
-            - 2 * (z_e @ self.codebook.weight.t())        # [B, K]
-            + self.codebook.weight.pow(2).sum(dim=1)      # [K]
+            z_e.pow(2).sum(dim=1, keepdim=True)
+            - 2 * (z_e @ self.codebook.weight.t())
+            + self.codebook.weight.pow(2).sum(dim=1)
         )
 
-        indices = dists.argmin(dim=1)                     # [B]
-        z_q = self.codebook(indices)                      # [B, d]
+        indices = dists.argmin(dim=1)
+        z_q = self.codebook(indices)
 
         # EMA codebook update (training only)
         if self.training:
             with torch.no_grad():
                 one_hot = F.one_hot(indices, self.K).float()          # [B, K]
-                new_cluster_size = one_hot.sum(0)                     # [K]
+                new_cluster_size  = one_hot.sum(0)                    # [K]
                 new_embedding_sum = one_hot.t() @ z_e                 # [K, d]
 
                 self.ema_cluster_size.mul_(self.ema_decay).add_(
@@ -93,27 +93,25 @@ class VectorQuantizer(nn.Module):
                     new_embedding_sum * (1 - self.ema_decay)
                 )
 
-                # Laplace smoothing to prevent divide-by-zero on rare codes
+                # Laplace smoothing
                 n = self.ema_cluster_size.sum()
                 smoothed = (
                     (self.ema_cluster_size + 1e-5)
                     / (n + self.K * 1e-5)
                     * n
                 )
-                updated = self.ema_embedding_sum / smoothed.unsqueeze(1)
-                self.codebook.weight.data.copy_(updated)
+                self.codebook.weight.data.copy_(
+                    self.ema_embedding_sum / smoothed.unsqueeze(1)
+                )
 
                 # ── Dead code restart ────────────────────────────────────────
-                # Any code with near-zero usage is reinitialised from a random
-                # encoder output in the current batch. This prevents the
-                # codebook collapsing to a small active subset.
-                dead_mask = self.ema_cluster_size < 0.5              # [K] bool
+                # Threshold raised to 1.0 (was 0.5) so codes are recycled more
+                # aggressively before they fully die and stop competing.
+                dead_mask = self.ema_cluster_size < 1.0
                 n_dead = dead_mask.sum().item()
                 if n_dead > 0:
-                    n_available = z_e.shape[0]
-                    # Sample with replacement if batch smaller than n_dead
                     rand_idx = torch.randint(
-                        0, n_available, (n_dead,), device=z_e.device
+                        0, z_e.shape[0], (n_dead,), device=z_e.device
                     )
                     self.codebook.weight.data[dead_mask] = z_e[rand_idx].detach()
                     self.ema_cluster_size[dead_mask] = 1.0
@@ -121,11 +119,11 @@ class VectorQuantizer(nn.Module):
                 # ─────────────────────────────────────────────────────────────
 
         # VQ losses
-        loss_codebook = F.mse_loss(z_q, z_e.detach())           # move codebook → encoder
-        loss_commit   = F.mse_loss(z_e, z_q.detach())           # move encoder → codebook
+        loss_codebook = F.mse_loss(z_q, z_e.detach())
+        loss_commit   = F.mse_loss(z_e, z_q.detach())
         loss_vq       = loss_codebook + self.beta * loss_commit
 
-        # Straight-through estimator: z_q in forward, z_e gradient in backward
+        # Straight-through estimator
         z_q_st = z_e + (z_q - z_e).detach()
 
         return z_q_st, z_q, indices, loss_vq
@@ -141,8 +139,7 @@ class VectorQuantizer(nn.Module):
 class SubjectResidualHead(nn.Module):
     """
     Per-subject embedding bias injected before a shared MLP.
-    Encodes individual variation (electrode offsets, oscillatory profiles etc.)
-    that the shared VQ code cannot represent.
+    Encodes individual variation that the shared VQ code cannot represent.
     """
 
     def __init__(self, input_dim: int, num_subjects: int, hidden_dim: int = None):
@@ -160,8 +157,8 @@ class SubjectResidualHead(nn.Module):
         )
 
     def forward(self, z_e_subject: torch.Tensor, subject_id: torch.LongTensor):
-        bias = self.subject_embedding(subject_id)       # [B, input_dim]
-        return self.mlp(z_e_subject + bias)             # [B, input_dim]
+        bias = self.subject_embedding(subject_id)
+        return self.mlp(z_e_subject + bias)
 
 
 # =============================================================================
@@ -171,10 +168,8 @@ class SubjectResidualHead(nn.Module):
 class ReconstructionDecoder(nn.Module):
     """
     Reconstructs z_e from (z_shared, z_subject).
-
-    Forces z_subject to encode whatever individual variation VQ discarded:
-    without z_subject carrying real signal, reconstruction loss stays high.
-    Target is z_e.detach() so reconstruction gradients don't perturb the encoder.
+    Forces z_subject to encode whatever individual variation VQ discarded.
+    Target is z_e.detach() so reconstruction gradients don't perturb encoder.
     """
 
     def __init__(self, d_shared: int, d_subject: int):
@@ -197,9 +192,8 @@ class ReconstructionDecoder(nn.Module):
 
 class EEGNeXBackbone(EEGModuleMixin, nn.Module):
     """
-    Standard EEGNeX convolutional encoder, shared across all subjects.
-    No subject-specific parameters anywhere in this module.
-    Outputs flat embedding [batch, out_features].
+    Standard EEGNeX convolutional encoder shared across all subjects.
+    No subject-specific parameters. Outputs flat embedding [batch, out_features].
     """
 
     def __init__(
@@ -234,9 +228,9 @@ class EEGNeXBackbone(EEGModuleMixin, nn.Module):
         f3 = filter_2 * depth_multiplier
 
         kb = (1, kernel_block_1_2)
-        k4 = (1, kernel_block_4);   d4 = (1, dilation_block_4)
+        k4 = (1, kernel_block_4);  d4 = (1, dilation_block_4)
         p4 = (1, avg_pool_block4)
-        k5 = (1, kernel_block_5);   d5 = (1, dilation_block_5)
+        k5 = (1, kernel_block_5);  d5 = (1, dilation_block_5)
         p5 = (1, avg_pool_block5)
 
         self._p4 = avg_pool_block4
@@ -281,7 +275,7 @@ class EEGNeXBackbone(EEGModuleMixin, nn.Module):
         x = self.block_3(x)
         x = self.block_4(x)
         x = self.block_5(x)
-        return x   # [batch, out_features]
+        return x
 
     def _calc_out(self, p4: int, p5: int) -> int:
         T3 = math.floor((self.n_times + 2 - p4) / p4) + 1
@@ -306,7 +300,7 @@ class VQDecomposedHead(nn.Module):
         num_subjects: int,
         codebook_size: int = 64,
         commitment_beta: float = 0.25,
-        ema_decay: float = 0.99,
+        ema_decay: float = 0.95,
         max_norm_clf: float = 0.25,
     ):
         super().__init__()
@@ -370,7 +364,7 @@ class EEGNeXVQDecomposed(nn.Module):
         avg_pool_block5: int = 8,
         codebook_size: int = 64,
         commitment_beta: float = 0.25,
-        ema_decay: float = 0.99,
+        ema_decay: float = 0.95,
     ):
         super().__init__()
 
@@ -398,9 +392,9 @@ class EEGNeXVQDecomposed(nn.Module):
 
     def encode_shared(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Inference / retrieval: discrete z_q only.
-        No subject_id passed, z_subject discarded.
-        This is the cross-subject generalisation pathway.
+        Inference / retrieval: returns discrete z_q only.
+        No subject_id used, z_subject discarded.
+        Cross-subject generalisation pathway.
         """
         z_e = self.backbone(x)
         z_e_shared = z_e[:, :self.head.d_shared]
@@ -414,23 +408,22 @@ class EEGNeXVQDecomposed(nn.Module):
 
 def compute_loss(
     logits, labels, z_q_st, z_subject, z_e_recon, z_e, loss_vq,
-    lambda_vq: float = 1.0,
+    lambda_vq: float = 2.0,
     lambda_recon: float = 0.5,
     lambda_ortho: float = 1.0,
 ):
     """
-    L = L_cls + lambda_vq * L_vq + lambda_recon * L_recon + lambda_ortho * L_ortho
+    L = L_cls + lambda_vq*L_vq + lambda_recon*L_recon + lambda_ortho*L_ortho
 
-    L_cls   : CrossEntropy        -- z_shared must encode class-discriminative content
-    L_vq    : codebook+commitment -- codebook and encoder stay aligned
-    L_recon : MSE(recon, z_e)     -- z_subject must encode what VQ discarded
+    L_cls   : CrossEntropy        -- z_shared encodes class-discriminative content
+    L_vq    : codebook+commitment -- encoder and codebook stay aligned
+    L_recon : MSE(recon, z_e)     -- z_subject encodes what VQ discarded
     L_ortho : squared dot product -- forces z_shared and z_subject to encode
                                      different information (disentanglement)
     """
     L_cls   = F.cross_entropy(logits, labels)
     L_recon = F.mse_loss(z_e_recon, z_e.detach())
 
-    # Normalise both to unit vectors then measure squared cosine similarity
     d = min(z_q_st.shape[1], z_subject.shape[1])
     z_s = F.normalize(z_q_st[:, :d],    dim=-1)
     z_u = F.normalize(z_subject[:, :d], dim=-1)
@@ -452,18 +445,13 @@ def compute_loss(
 
 
 # =============================================================================
-# 8. Codebook Warm-Start (kmeans init from real encoder outputs)
+# 8. Codebook Warm-Start
 # =============================================================================
 
 def init_codebook_from_data(model, dataloader, device, n_batches: int = 10):
     """
-    Initialise the VQ codebook from real encoder outputs before training.
-
-    Runs n_batches forward passes through the backbone, collects z_e_shared
-    embeddings, then seeds the codebook with K randomly selected samples.
-    This prevents the cold-start collapse where random init places all codes
-    far from the actual encoder output distribution.
-
+    Initialise VQ codebook from real encoder outputs before training.
+    Prevents cold-start collapse from random uniform initialisation.
     Call once after model creation, before the training loop.
     """
     model.eval()
@@ -474,22 +462,21 @@ def init_codebook_from_data(model, dataloader, device, n_batches: int = 10):
             if i >= n_batches:
                 break
             z_e = model.backbone(X.to(device))
-            z_e_shared = z_e[:, :model.head.d_shared]
-            samples.append(z_e_shared.cpu())
+            samples.append(z_e[:, :model.head.d_shared].cpu())
 
-    samples = torch.cat(samples, dim=0)   # [N, d_shared]
+    samples = torch.cat(samples, dim=0)
     K = model.head.vq.K
 
-    if len(samples) < K:
-        # If we somehow have fewer samples than codes, sample with replacement
-        idx = torch.randint(0, len(samples), (K,))
-    else:
-        idx = torch.randperm(len(samples))[:K]
+    idx = (
+        torch.randperm(len(samples))[:K]
+        if len(samples) >= K
+        else torch.randint(0, len(samples), (K,))
+    )
 
     init_weights = samples[idx].to(device)
     model.head.vq.codebook.weight.data.copy_(init_weights)
     model.head.vq.ema_embedding_sum.copy_(init_weights)
-    model.head.vq.ema_cluster_size.fill_(1.0)   # treat all as equally initialised
+    model.head.vq.ema_cluster_size.fill_(1.0)
 
     print(f"Codebook warm-started from {len(samples)} real encoder outputs "
           f"(K={K}, d={model.head.d_shared})")
@@ -505,22 +492,20 @@ def main(config):
     from utils import get_PhysionetMI
     import os
 
-    # ── Verify data is present ──────────────────────────────────────────────
+    # Verify data is present
     DATA_DIR = os.path.expanduser("~/mne_data/MNE-eegbci-data/files/eegmmidb/1.0.0")
-    RUNS = [4, 6, 8, 10, 12, 14]
     missing = [
-        (s, r) for s in config["subject"] for r in RUNS
+        (s, r) for s in config["subject"] for r in [4, 6, 8, 10, 12, 14]
         if not os.path.exists(
             os.path.join(DATA_DIR, f"S{s:03d}", f"S{s:03d}R{r:02d}.edf")
         )
     ]
     if missing:
-        missing_subjects = sorted(set(s for s, _ in missing))
-        print(f"ERROR: {len(missing_subjects)} subjects not downloaded.")
+        print(f"ERROR: {len(set(s for s,_ in missing))} subjects not downloaded.")
         print("Run: python download_physionet.py")
         raise SystemExit(1)
 
-    # ── Load and prepare data ───────────────────────────────────────────────
+    # Load data
     print(f"Loading PhysionetMI for {len(config['subject'])} subjects...")
     data, labels, meta, channels = get_PhysionetMI(
         subject=config["subject"],
@@ -528,7 +513,7 @@ def main(config):
         freq_max=config["freq"][1],
     )
 
-    # Keep only left_hand=0, right_hand=1, feet=2
+    # Keep left_hand=0, right_hand=1, feet=2
     mask   = np.isin(labels, [0, 1, 2])
     data   = data[mask]
     labels = labels[mask]
@@ -551,7 +536,7 @@ def main(config):
 
     print(f"Data: {data.shape} | Labels: {np.bincount(labels)} | Subjects: {num_subjects}")
 
-    # ── Train / test split ──────────────────────────────────────────────────
+    # Train / test split
     train_idx, test_idx = sk_split(
         np.arange(len(data)),
         test_size=0.2,
@@ -561,9 +546,9 @@ def main(config):
 
     class TensorsDataset(Dataset):
         def __init__(self, X, y, sids):
-            self.X   = torch.from_numpy(X).float()
-            self.y   = torch.from_numpy(y).long()
-            self.s   = torch.LongTensor(sids)
+            self.X = torch.from_numpy(X).float()
+            self.y = torch.from_numpy(y).long()
+            self.s = torch.LongTensor(sids)
         def __len__(self):
             return len(self.X)
         def __getitem__(self, i):
@@ -578,19 +563,15 @@ def main(config):
         batch_size=config["batch_size"], shuffle=False,
     )
 
-    # ── Model ───────────────────────────────────────────────────────────────
+    # Model
     cuda   = torch.cuda.is_available()
     device = "cuda" if cuda else "cpu"
     print(f"Using device: {device}")
 
-    n_channels = data.shape[1]
-    n_classes  = len(np.unique(labels))
-    n_times    = data.shape[2]
-
     model = EEGNeXVQDecomposed(
-        n_chans=n_channels,
-        n_outputs=n_classes,
-        n_times=n_times,
+        n_chans=data.shape[1],
+        n_outputs=len(np.unique(labels)),
+        n_times=data.shape[2],
         num_subjects=num_subjects,
         codebook_size=config["codebook_size"],
         commitment_beta=config["commitment_beta"],
@@ -604,19 +585,12 @@ def main(config):
     print(f"  d_subject (resid.) : {model.head.d_subject}")
     print(f"  Codebook size K    : {config['codebook_size']}")
 
-    # ── Codebook warm-start ─────────────────────────────────────────────────
-    # Initialise codebook from real encoder outputs before training begins.
-    # Prevents the cold-start collapse seen when using random uniform init.
-    init_codebook_from_data(
-        model, train_loader, device,
-        n_batches=config["warmstart_batches"],
-    )
+    # Codebook warm-start
+    init_codebook_from_data(model, train_loader, device, config["warmstart_batches"])
 
-    # ── Optimiser and scheduler ─────────────────────────────────────────────
+    # Optimiser and scheduler
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["lr"],
-        weight_decay=config["weight_decay"],
+        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config["epochs"]
@@ -625,7 +599,7 @@ def main(config):
     best_valid_acc   = 0.0
     patience_counter = 0
 
-    # ── Training loop ───────────────────────────────────────────────────────
+    # Training loop
     for epoch in range(config["epochs"]):
         model.train()
         running = {k: 0.0 for k in ["total", "cls", "vq", "recon", "ortho"]}
@@ -656,12 +630,11 @@ def main(config):
             train_correct += (logits.argmax(1) == targets).sum().item()
 
         scheduler.step()
-
         for k in running:
             running[k] /= len(train_loader)
         train_acc = train_correct / len(train_loader.dataset)
 
-        # ── Validation ──────────────────────────────────────────────────────
+        # Validation
         model.eval()
         valid_loss    = 0.0
         valid_correct = 0
@@ -720,9 +693,7 @@ def main(config):
 
     print(f"\nBest valid accuracy: {best_valid_acc:.4f}")
 
-    # ── Cross-subject evaluation: z_shared ONLY ─────────────────────────────
-    # Classify using only the discrete shared code, no subject adapter.
-    # This is the principled cross-subject generalisation test.
+    # Cross-subject evaluation: z_shared ONLY, no subject adapter
     print("\n--- Cross-subject eval (z_shared only, subject adapter discarded) ---")
     model.load_state_dict(torch.load("best_vq_decomposed.pt"))
     model.eval()
@@ -732,8 +703,8 @@ def main(config):
         for inputs, targets, sids in valid_loader:
             inputs  = inputs.to(device)
             targets = targets.to(device)
-            z_q     = model.encode_shared(inputs)
-            logits  = model.head.classifier(z_q)
+            z_q    = model.encode_shared(inputs)
+            logits = model.head.classifier(z_q)
             cs_correct += (logits.argmax(1) == targets).sum().item()
 
     cs_acc = cs_correct / len(valid_loader.dataset)
@@ -760,16 +731,16 @@ if __name__ == "__main__":
         "weight_decay": 0.01,
         "patience":     10,
 
-        # VQ  (key changes vs initial version)
-        "codebook_size":    64,     # was 512 — proportional to 3-class task
-        "commitment_beta":  0.25,
-        "ema_decay":        0.99,
-        "warmstart_batches": 10,    # batches to use for codebook warm-start
+        # VQ
+        "codebook_size":     64,
+        "commitment_beta":   0.25,
+        "ema_decay":         0.95,   # was 0.99 -- faster codebook tracking
+        "warmstart_batches": 10,
 
-        # Loss weights  (key changes vs initial version)
-        "lambda_vq":    1.0,
+        # Loss weights
+        "lambda_vq":    2.0,         # was 1.0 -- stronger encoder-codebook coupling
         "lambda_recon": 0.5,
-        "lambda_ortho": 1.0,        # was 0.1 — needs to be strong enough to matter
+        "lambda_ortho": 1.0,
     }
 
     torch.manual_seed(config["seed"])
