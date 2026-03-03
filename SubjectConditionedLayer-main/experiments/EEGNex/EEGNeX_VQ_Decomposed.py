@@ -1,11 +1,13 @@
-# EEGNeX with Decomposed VQ Latent Space  — v6
+# EEGNeX with Decomposed VQ Latent Space  — v7
 # ============================================================
 # z_shared  -- VQ-regularised continuous representation, shared across subjects
 # z_subject -- continuous subject residual
 #
-# Changes vs v5:
-#   1. codebook_size     64   -> 24  (8 per class, eliminates structural dead codes)
-#   2. commitment_beta   0.25 -> 0.5 (stronger pull, reduces continuous-discrete gap)
+# Changes vs v6:
+#   1. Class-anchored codebook initialisation
+#      Codes seeded from per-class encoder output clusters, not random samples
+#      Directly addresses the 0.0447 discretisation cost
+#   2. epochs 50 -> 100 (learning had not saturated at epoch 50)
 # ============================================================
 
 import math
@@ -33,13 +35,9 @@ class VectorQuantizer(nn.Module):
     Training:
         Soft weighted sum over codebook entries via Gumbel-Softmax.
         Temperature annealed from temp_start -> temp_end over training.
-        As temperature -> 0 this recovers hard argmin.
 
     Inference / retrieval:
         Hard argmin, returns nearest codebook entry.
-
-    The VQ loss acts as a regulariser that forces z_e_shared to organise
-    into discrete clusters. Classification acts on continuous z_e_shared.
 
     EMA codebook updates + dead code restart with threshold 0.1.
     """
@@ -71,7 +69,7 @@ class VectorQuantizer(nn.Module):
     def forward(self, z_e: torch.Tensor):
         """
         Args:
-            z_e : [B, d]  continuous encoder output (shared half)
+            z_e : [B, d]
 
         Returns:
             z_q_soft : [B, d]  soft weighted codebook vector (training)
@@ -81,28 +79,24 @@ class VectorQuantizer(nn.Module):
             weights  : [B, K]  soft assignment weights (for coherence loss)
             loss_vq  : scalar  codebook + commitment loss
         """
-        # Pairwise squared L2 distances  [B, K]
         dists = (
             z_e.pow(2).sum(dim=1, keepdim=True)
             - 2 * (z_e @ self.codebook.weight.t())
             + self.codebook.weight.pow(2).sum(dim=1)
         )
 
-        # Hard assignment (always computed for EMA and inference)
         indices  = dists.argmin(dim=1)
         z_q_hard = self.codebook(indices)
 
         if self.training:
-            # Gumbel-Softmax soft assignment
-            logits_vq = -dists / self.temperature              # [B, K]
-            weights   = F.softmax(logits_vq, dim=1)           # [B, K]
-            z_q_soft  = weights @ self.codebook.weight         # [B, d]
+            logits_vq = -dists / self.temperature
+            weights   = F.softmax(logits_vq, dim=1)
+            z_q_soft  = weights @ self.codebook.weight
 
-            # EMA codebook update using hard assignments
             with torch.no_grad():
-                one_hot = F.one_hot(indices, self.K).float()   # [B, K]
-                new_cluster_size  = one_hot.sum(0)             # [K]
-                new_embedding_sum = one_hot.t() @ z_e          # [K, d]
+                one_hot = F.one_hot(indices, self.K).float()
+                new_cluster_size  = one_hot.sum(0)
+                new_embedding_sum = one_hot.t() @ z_e
 
                 self.ema_cluster_size.mul_(self.ema_decay).add_(
                     new_cluster_size * (1 - self.ema_decay)
@@ -111,7 +105,6 @@ class VectorQuantizer(nn.Module):
                     new_embedding_sum * (1 - self.ema_decay)
                 )
 
-                # Laplace smoothing
                 n = self.ema_cluster_size.sum()
                 smoothed = (
                     (self.ema_cluster_size + 1e-5)
@@ -134,11 +127,9 @@ class VectorQuantizer(nn.Module):
                     self.ema_embedding_sum[dead_mask]    = z_e[rand_idx].detach()
 
         else:
-            # Inference: hard assignment
             z_q_soft = z_q_hard
             weights  = F.one_hot(indices, self.K).float()
 
-        # VQ losses computed against hard assignment
         loss_codebook = F.mse_loss(z_q_hard, z_e.detach())
         loss_commit   = F.mse_loss(z_e, z_q_hard.detach())
         loss_vq       = loss_codebook + self.beta * loss_commit
@@ -146,7 +137,6 @@ class VectorQuantizer(nn.Module):
         return z_q_soft, z_q_hard, indices, weights, loss_vq
 
     def set_temperature(self, epoch: int, total_epochs: int):
-        """Anneal temperature linearly from temp_start to temp_end."""
         frac = epoch / max(total_epochs - 1, 1)
         self.temperature = self.temp_start + frac * (self.temp_end - self.temp_start)
 
@@ -349,7 +339,6 @@ class VQDecomposedHead(nn.Module):
             d_shared=self.d_shared,
             d_subject=self.d_subject,
         )
-        # Classifier acts on continuous z_e_shared — not z_q
         self.classifier = LinearWithConstraint(
             in_features=self.d_shared,
             out_features=n_outputs,
@@ -363,9 +352,7 @@ class VQDecomposedHead(nn.Module):
         z_q_soft, z_q_hard, indices, weights, loss_vq = self.vq(z_e_shared)
         z_subject = self.subject_head(z_e_subject, subject_id)
         z_e_recon = self.decoder(z_q_soft, z_subject)
-
-        # Clean gradient path: continuous z_e_shared -> classifier
-        logits = self.classifier(z_e_shared)
+        logits    = self.classifier(z_e_shared)
 
         return logits, z_e_shared, z_q_soft, z_subject, z_e_recon, weights, loss_vq
 
@@ -454,16 +441,6 @@ def compute_loss(
     lambda_ortho: float     = 1.0,
     lambda_coherence: float = 0.5,
 ):
-    """
-    L = L_cls + lambda_vq*L_vq + lambda_recon*L_recon
-      + lambda_ortho*L_ortho + lambda_coherence*L_coherence
-
-    L_cls       : CrossEntropy on continuous z_e_shared
-    L_vq        : codebook+commitment regulariser
-    L_recon     : MSE(recon, z_e) — z_subject encodes what VQ discarded
-    L_ortho     : squared cosine similarity — disentanglement constraint
-    L_coherence : within-class VQ weight variance — class-coherent codebook
-    """
     L_cls   = F.cross_entropy(logits, labels)
     L_recon = F.mse_loss(z_e_recon, z_e.detach())
 
@@ -499,40 +476,61 @@ def compute_loss(
 
 
 # =============================================================================
-# 8. Codebook Warm-Start
+# 8. Class-Anchored Codebook Initialisation
 # =============================================================================
 
-def init_codebook_from_data(model, dataloader, device, n_batches: int = 10):
+def init_codebook_class_anchored(
+    model, dataloader, device, n_classes: int, n_batches: int = 20
+):
     """
-    Initialise VQ codebook from real encoder outputs before training.
-    Prevents cold-start collapse from random uniform initialisation.
+    Initialise VQ codebook from per-class encoder output clusters.
+
+    Rather than seeding codes randomly from encoder outputs (which places
+    them without regard to class structure), this seeds codes_per_class
+    entries from each class's actual encoder output distribution.
+
+    This directly addresses the discretisation cost: if codes start in the
+    right class regions, hard discrete lookup at inference lands in the
+    correct neighbourhood from the beginning of training.
     """
     model.eval()
-    samples = []
+    class_samples = {c: [] for c in range(n_classes)}
 
     with torch.no_grad():
         for i, (X, y, s) in enumerate(dataloader):
             if i >= n_batches:
                 break
             z_e = model.backbone(X.to(device))
-            samples.append(z_e[:, :model.head.d_shared].cpu())
+            z_e_shared = z_e[:, :model.head.d_shared]
+            for c in range(n_classes):
+                mask = y == c
+                if mask.any():
+                    class_samples[c].append(z_e_shared[mask].cpu())
 
-    samples = torch.cat(samples, dim=0)
     K = model.head.vq.K
+    codes_per_class = K // n_classes
+    remainder       = K - codes_per_class * n_classes  # handle non-divisible K
+    init_weights    = []
 
-    idx = (
-        torch.randperm(len(samples))[:K]
-        if len(samples) >= K
-        else torch.randint(0, len(samples), (K,))
-    )
+    for c in range(n_classes):
+        samples_c = torch.cat(class_samples[c], dim=0)
+        n_codes   = codes_per_class + (1 if c < remainder else 0)
+        idx = (
+            torch.randperm(len(samples_c))[:n_codes]
+            if len(samples_c) >= n_codes
+            else torch.randint(0, len(samples_c), (n_codes,))
+        )
+        init_weights.append(samples_c[idx])
 
-    init_weights = samples[idx].to(device)
+    init_weights = torch.cat(init_weights, dim=0).to(device)
     model.head.vq.codebook.weight.data.copy_(init_weights)
     model.head.vq.ema_embedding_sum.copy_(init_weights)
     model.head.vq.ema_cluster_size.fill_(1.0)
 
-    print(f"Codebook warm-started from {len(samples)} real encoder outputs "
-          f"(K={K}, d={model.head.d_shared})")
+    print(
+        f"Codebook class-anchored init: {codes_per_class} codes/class "
+        f"(K={K}, d={model.head.d_shared}, n_classes={n_classes})"
+    )
     model.train()
 
 
@@ -578,6 +576,7 @@ def main(config):
     subject_to_idx  = {s: i for i, s in enumerate(unique_subjects)}
     subject_ids     = np.array([subject_to_idx[s] for s in meta["subject"]])
     num_subjects    = len(unique_subjects)
+    n_classes       = len(np.unique(labels))
 
     # Crop to 512 samples
     n_t = data.shape[2]
@@ -623,7 +622,7 @@ def main(config):
 
     model = EEGNeXVQDecomposed(
         n_chans=data.shape[1],
-        n_outputs=len(np.unique(labels)),
+        n_outputs=n_classes,
         n_times=data.shape[2],
         num_subjects=num_subjects,
         filter_1=config["filter_1"],
@@ -641,8 +640,14 @@ def main(config):
     print(f"  d_subject (resid.) : {model.head.d_subject}")
     print(f"  Codebook size K    : {config['codebook_size']}")
 
-    # Codebook warm-start
-    init_codebook_from_data(model, train_loader, device, config["warmstart_batches"])
+    # Class-anchored codebook initialisation
+    # Replaces random warm-start — seeds codes directly from per-class
+    # encoder output clusters to reduce discretisation cost from the start
+    init_codebook_class_anchored(
+        model, train_loader, device,
+        n_classes=n_classes,
+        n_batches=config["warmstart_batches"],
+    )
 
     # Optimiser and scheduler
     optimizer = torch.optim.AdamW(
@@ -658,7 +663,6 @@ def main(config):
     # Training loop
     for epoch in range(config["epochs"]):
 
-        # Anneal Gumbel temperature
         model.set_temperature(epoch, config["epochs"])
         current_temp = model.head.vq.temperature
 
@@ -780,12 +784,12 @@ def main(config):
             inputs  = inputs.to(device)
             targets = targets.to(device)
 
-            # Hard discrete code — true cross-subject retrieval setting
+            # Hard discrete — true cross-subject retrieval pathway
             z_q_hard = model.encode_shared(inputs)
             logits_hard = model.head.classifier(z_q_hard)
             cs_correct_hard += (logits_hard.argmax(1) == targets).sum().item()
 
-            # Continuous z_e_shared — upper bound for shared-only pathway
+            # Continuous z_e_shared — upper bound
             z_e = model.backbone(inputs)
             z_e_shared = z_e[:, :model.head.d_shared]
             logits_cont = model.head.classifier(z_e_shared)
@@ -818,20 +822,20 @@ if __name__ == "__main__":
         "seed":    1,
 
         # Training
-        "epochs":       50,
+        "epochs":       100,    # was 50 — learning had not saturated
         "batch_size":   64,
         "lr":           1e-3,
         "weight_decay": 0.01,
-        "patience":     10,
+        "patience":     15,     # increased to match longer run
 
         # Backbone
         "filter_1": 16,
 
         # VQ
-        "codebook_size":     24,    # was 64 -- 8 per class, eliminates structural dead codes
-        "commitment_beta":   0.5,   # was 0.25 -- stronger pull, reduces continuous-discrete gap
+        "codebook_size":     24,
+        "commitment_beta":   0.5,
         "ema_decay":         0.95,
-        "warmstart_batches": 10,
+        "warmstart_batches": 20,    # more batches for class-anchored init
         "temp_start":        1.0,
         "temp_end":          0.1,
 
