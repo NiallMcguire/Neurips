@@ -24,7 +24,7 @@ from meta_init import get_adapter_params, freeze_backbone, unfreeze_all, LORA_LA
 
 
 FEW_SHOT_NS   = [5, 10, 20, 50]
-N_ADAPT_STEPS = 20      # gradient steps during few-shot adaptation
+N_ADAPT_STEPS = 10      # gradient steps during few-shot adaptation
 ADAPT_LR      = 5e-4    # lower than training LR — careful fine-tuning
 ADAPT_BATCH   = 16      # small batch for few-shot
 
