@@ -1,27 +1,41 @@
 #!/bin/bash
 #=================================================================
 # Reptile LoRA vs Baseline LoRA — LOSO Evaluation
-# BCI Competition IV 2a (9 subjects, 4-class motor imagery)
+# BCI Competition IV 2a + 2b
 #
 # Array layout:
-#   2 conditions x 9 subjects x 3 seeds = 54 tasks
+#   2 conditions x 2 datasets x 9 subjects x 3 seeds = 108 tasks
 #
-#   Task ID mapping:
-#     seed_idx      = TASK_ID % 3
-#     subject_idx   = (TASK_ID / 3) % 9
-#     condition_idx = TASK_ID / 27
+#   Interleaved so that after 6 tasks you have both conditions
+#   fully evaluated on one subject of one dataset across all seeds.
+#   This means meaningful comparisons appear early if running
+#   sequentially on a single GPU.
 #
-# Submit all 54 jobs:
-#   sbatch run_reptile.sh
+#   Factor order (innermost -> outermost):
+#     seed      (3)  — innermost, cycles fastest
+#     condition (2)
+#     subject   (9)
+#     dataset   (2)  — outermost, cycles slowest
 #
-# Submit a single job for debugging (task 0 = baseline, subject 1, seed 1):
-#   sbatch --array=0-0 run_reptile.sh
+#   Example mapping:
+#     Task  0: BCI2a, baseline_lora, subject 1, seed 1
+#     Task  1: BCI2a, baseline_lora, subject 1, seed 2
+#     Task  2: BCI2a, baseline_lora, subject 1, seed 3
+#     Task  3: BCI2a, reptile_lora,  subject 1, seed 1
+#     Task  4: BCI2a, reptile_lora,  subject 1, seed 2
+#     Task  5: BCI2a, reptile_lora,  subject 1, seed 3
+#     Task  6: BCI2a, baseline_lora, subject 2, seed 1
+#     ...
+#     Task 53: BCI2a, reptile_lora,  subject 9, seed 3
+#     Task 54: BCI2b, baseline_lora, subject 1, seed 1
+#     ...
+#     Task107: BCI2b, reptile_lora,  subject 9, seed 3
 #
-# Submit only reptile condition (tasks 27-53):
-#   sbatch --array=27-53 run_reptile.sh
-#
-# Submit only baseline condition (tasks 0-26):
-#   sbatch --array=0-26 run_reptile.sh
+# Useful partial submissions:
+#   BCI2a only:          sbatch --array=0-53   run_reptile.sh
+#   BCI2b only:          sbatch --array=54-107 run_reptile.sh
+#   Single debug job:    sbatch --array=0-0    run_reptile.sh
+#   Reptile only BCI2a:  sbatch --array=3-53:6 run_reptile.sh
 #=================================================================
 
 #SBATCH --export=ALL
@@ -32,7 +46,7 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --job-name=reptile_lora
 #SBATCH --output=logs/reptile_%A_%a.out
-#SBATCH --array=0-53
+#SBATCH --array=0-107
 
 module purge
 module load nvidia/sdk/23.3
@@ -44,28 +58,41 @@ cd /users/gxb18167/Neurips/SubjectConditionedLayer-main/experiments/reptile_lora
 
 mkdir -p logs
 
-# ── Factor arrays ─────────────────────────────────────────────────────────────
-CONDITIONS=("baseline_lora" "reptile_lora")
+# ── Factor arrays ──────────────────────────────────────────────────────────────
+DATASETS=("BCI2a" "BCI2b")
 SUBJECTS=(1 2 3 4 5 6 7 8 9)
+CONDITIONS=("baseline_lora" "reptile_lora")
 SEEDS=(1 2 3)
 
-N_CONDITIONS=${#CONDITIONS[@]}   # 2
+N_DATASETS=${#DATASETS[@]}       # 2
 N_SUBJECTS=${#SUBJECTS[@]}       # 9
+N_CONDITIONS=${#CONDITIONS[@]}   # 2
 N_SEEDS=${#SEEDS[@]}             # 3
 
-# Map SLURM_ARRAY_TASK_ID -> (condition, subject, seed)
+# Tasks per dataset = N_SUBJECTS * N_CONDITIONS * N_SEEDS = 9 * 2 * 3 = 54
+TASKS_PER_DATASET=$(( N_SUBJECTS * N_CONDITIONS * N_SEEDS ))
+
+# Map SLURM_ARRAY_TASK_ID -> (dataset, subject, condition, seed)
+# Factor order innermost -> outermost: seed, condition, subject, dataset
 TASK_ID=${SLURM_ARRAY_TASK_ID}
 
-SEED_IDX=$(( TASK_ID % N_SEEDS ))
-SUBJECT_IDX=$(( (TASK_ID / N_SEEDS) % N_SUBJECTS ))
-CONDITION_IDX=$(( TASK_ID / (N_SEEDS * N_SUBJECTS) ))
+DATASET_IDX=$(( TASK_ID / TASKS_PER_DATASET ))
+REMAINDER=$(( TASK_ID % TASKS_PER_DATASET ))
 
-CONDITION=${CONDITIONS[$CONDITION_IDX]}
+SUBJECT_IDX=$(( REMAINDER / (N_CONDITIONS * N_SEEDS) ))
+REMAINDER2=$(( REMAINDER % (N_CONDITIONS * N_SEEDS) ))
+
+CONDITION_IDX=$(( REMAINDER2 / N_SEEDS ))
+SEED_IDX=$(( REMAINDER2 % N_SEEDS ))
+
+DATASET=${DATASETS[$DATASET_IDX]}
 HELD_OUT=${SUBJECTS[$SUBJECT_IDX]}
+CONDITION=${CONDITIONS[$CONDITION_IDX]}
 SEED=${SEEDS[$SEED_IDX]}
 
 echo "========================================================"
 echo " Task ID:    ${SLURM_ARRAY_TASK_ID}"
+echo " Dataset:    ${DATASET}"
 echo " Condition:  ${CONDITION}"
 echo " Held-out:   subject ${HELD_OUT}"
 echo " Seed:       ${SEED}"
@@ -73,6 +100,7 @@ echo "========================================================"
 
 python run_experiment.py \
     --condition "${CONDITION}" \
+    --dataset   "${DATASET}" \
     --held_out  "${HELD_OUT}" \
     --seed      "${SEED}"
 

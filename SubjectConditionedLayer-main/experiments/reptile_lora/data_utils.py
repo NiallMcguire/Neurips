@@ -1,8 +1,9 @@
 """
 Data utilities for Reptile LoRA experiments.
 
-Loads BCI2a (BNCI2014001) and returns per-subject train/test splits
-consistent with the LOSO evaluation structure.
+Supports:
+    BCI2a — BNCI2014001, 22 channels, 4-class motor imagery, 9 subjects
+    BCI2b — BNCI2014004,  3 channels, 2-class motor imagery, 9 subjects
 
 All subject IDs returned are 0-indexed (original 1-9 -> 0-8).
 """
@@ -13,7 +14,7 @@ from torch.utils.data import Dataset
 
 import sys
 sys.path.insert(0, '../EEGNex')
-from utils import get_BNCI2014001
+from utils import get_BNCI2014001, get_BNCI2014004
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -36,12 +37,13 @@ class EEGDataset(Dataset):
         return self.X[idx], self.y[idx], self.subject_id[idx]
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# ── BCI2a loading ─────────────────────────────────────────────────────────────
 
 def load_bci2a(freq_min=8, freq_max=45):
     """
-    Load all 9 subjects from BCI Competition IV 2a.
-    Returns raw arrays with metadata.
+    Load all 9 subjects from BCI Competition IV 2a (BNCI2014001).
+    22 channels, 4-class motor imagery.
+    Cropped to 512 samples matching existing EEGNeX experiments.
     """
     ALL_SUBJECTS = list(range(1, 10))
 
@@ -54,62 +56,102 @@ def load_bci2a(freq_min=8, freq_max=45):
     # Crop to 512 samples matching existing EEGNeX experiments
     data = data[:, :, 244:756]
 
-    # Remap subject IDs 1-9 -> 0-8
     subjects_raw = np.array(meta['subject'].values)
-    subject_ids  = subjects_raw - 1
-
-    sessions = np.array(meta['session'].values)
+    subject_ids  = subjects_raw - 1    # 1-9 -> 0-8
+    sessions     = np.array(meta['session'].values)
 
     return data, labels, subject_ids, sessions, channels
 
 
-def build_loso_split(data, labels, subject_ids, sessions, held_out_subject_0idx):
+# ── BCI2b loading ─────────────────────────────────────────────────────────────
+
+def load_bci2b(freq_min=8, freq_max=45):
     """
-    Build LOSO train/test split.
+    Load all 9 subjects from BCI Competition IV 2b (BNCI2014004).
+    3 channels (C3, Cz, C4), 2-class motor imagery (left/right hand).
+    5 sessions per subject: 0,1,2 for training; 3,4 for test.
+    No fixed crop — use full trial from the MOABB paradigm.
+    """
+    ALL_SUBJECTS = list(range(1, 10))
+
+    data, labels, meta, channels = get_BNCI2014004(
+        subject=ALL_SUBJECTS,
+        freq_min=freq_min,
+        freq_max=freq_max,
+    )
+
+    subjects_raw = np.array(meta['subject'].values)
+    subject_ids  = subjects_raw - 1    # 1-9 -> 0-8
+    sessions     = np.array(meta['session'].values)
+
+    return data, labels, subject_ids, sessions, channels
+
+
+# ── Dataset config ────────────────────────────────────────────────────────────
+
+# Maps dataset name to (train_sessions, test_sessions)
+# BCI2a uses MOABB session labels '0train' and '1test'
+# BCI2b uses MOABB session labels 'session_0' ... 'session_4'
+DATASET_SESSIONS = {
+    'BCI2a': {
+        'train': ('0train',),
+        'test':  ('1test',),
+    },
+    'BCI2b': {
+        'train': ('session_0', 'session_1', 'session_2'),
+        'test':  ('session_3', 'session_4'),
+    },
+}
+
+
+# ── LOSO split ────────────────────────────────────────────────────────────────
+
+def build_loso_split(data, labels, subject_ids, sessions,
+                     held_out_subject_0idx, dataset='BCI2a'):
+    """
+    Build LOSO train/test split for either dataset.
 
     held_out_subject_0idx: 0-indexed subject to hold out (0-8)
+    dataset: 'BCI2a' or 'BCI2b' — determines which session labels to use
 
     Returns:
-        train_X, train_y, train_sids  — training subjects, session T data
-        cal_X,   cal_y,   cal_sids    — held-out subject, session T (calibration pool)
-        test_X,  test_y,  test_sids   — held-out subject, session E (evaluation)
+        train_X, train_y, train_sids  — training subjects, train session data
+        cal_X,   cal_y,   cal_sids    — held-out subject, train sessions (calibration pool)
+        test_X,  test_y,  test_sids   — held-out subject, test sessions (evaluation)
     """
-    train_mask = (
-        (subject_ids != held_out_subject_0idx) &
-        (sessions == '0train')
-    )
-    cal_mask = (
-        (subject_ids == held_out_subject_0idx) &
-        (sessions == '0train')
-    )
-    test_mask = (
-        (subject_ids == held_out_subject_0idx) &
-        (sessions == '1test')
-    )
+    train_sessions = DATASET_SESSIONS[dataset]['train']
+    test_sessions  = DATASET_SESSIONS[dataset]['test']
 
-    train_X   = data[train_mask]
-    train_y   = labels[train_mask]
+    in_train_session = np.isin(sessions, train_sessions)
+    in_test_session  = np.isin(sessions, test_sessions)
+
+    train_mask = (subject_ids != held_out_subject_0idx) & in_train_session
+    cal_mask   = (subject_ids == held_out_subject_0idx) & in_train_session
+    test_mask  = (subject_ids == held_out_subject_0idx) & in_test_session
+
+    train_X    = data[train_mask]
+    train_y    = labels[train_mask]
     train_sids = subject_ids[train_mask]
 
-    # Remap training subject IDs to be contiguous 0..n_train-1
-    # e.g. if held out is 2 (0-idx), training subjects are 0,1,3,4,5,6,7,8
-    # remapped to                                           0,1,2,3,4,5,6,7
+    # Remap training subject IDs to contiguous 0..n_train-1
     unique_train = np.sort(np.unique(train_sids))
     remap        = {old: new for new, old in enumerate(unique_train)}
     train_sids_remapped = np.array([remap[s] for s in train_sids])
 
-    cal_X   = data[cal_mask]
-    cal_y   = labels[cal_mask]
-    cal_sids = np.zeros(len(cal_X), dtype=int)   # new subject always slot 0
+    cal_X    = data[cal_mask]
+    cal_y    = labels[cal_mask]
+    cal_sids = np.zeros(len(cal_X), dtype=int)
 
-    test_X   = data[test_mask]
-    test_y   = labels[test_mask]
+    test_X    = data[test_mask]
+    test_y    = labels[test_mask]
     test_sids = np.zeros(len(test_X), dtype=int)
 
     return (train_X, train_y, train_sids_remapped,
             cal_X,  cal_y,  cal_sids,
             test_X, test_y, test_sids)
 
+
+# ── Per-subject dict for Reptile inner loop ───────────────────────────────────
 
 def build_per_subject_dict(train_X, train_y, train_sids):
     """
@@ -123,3 +165,18 @@ def build_per_subject_dict(train_X, train_y, train_sids):
             torch.from_numpy(train_y[mask]).long(),
         )
     return subject_data
+
+
+# ── Convenience loader ────────────────────────────────────────────────────────
+
+def load_dataset(dataset, freq_min=8, freq_max=45):
+    """
+    Dispatch to the correct loader by dataset name.
+    Returns (data, labels, subject_ids, sessions, channels).
+    """
+    if dataset == 'BCI2a':
+        return load_bci2a(freq_min=freq_min, freq_max=freq_max)
+    elif dataset == 'BCI2b':
+        return load_bci2b(freq_min=freq_min, freq_max=freq_max)
+    else:
+        raise ValueError(f'Unknown dataset: {dataset}. Choose BCI2a or BCI2b.')
