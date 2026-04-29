@@ -98,8 +98,10 @@ DATASET_SESSIONS = {
         'test':  ('1test',),
     },
     'BCI2b': {
-        'train': ('session_0', 'session_1', 'session_2'),
-        'test':  ('session_3', 'session_4'),
+        # Verified from MOABB output: sessions are labelled
+        # '0train', '1train', '2train', '3test', '4test'
+        'train': ('0train', '1train', '2train'),
+        'test':  ('3test', '4test'),
     },
 }
 
