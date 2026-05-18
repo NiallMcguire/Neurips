@@ -4,11 +4,21 @@ Main entry point for Reptile LoRA vs Baseline LoRA experiments.
 Supports BCI2a (22ch, 4-class) and BCI2b (3ch, 2-class).
 
 Usage:
-    python run_experiment.py --condition baseline_lora --dataset BCI2a --held_out 9 --seed 1
-    python run_experiment.py --condition reptile_lora  --dataset BCI2b --held_out 9 --seed 1
+    python run_experiment.py --condition baseline_lora       --dataset BCI2a --held_out 9 --seed 1
+    python run_experiment.py --condition reptile_lora        --dataset BCI2b --held_out 9 --seed 1
+    python run_experiment.py --condition reptile_lora_grassmann --dataset BCI2a --held_out 9 --seed 1
+
+Conditions:
+    baseline_lora          — zero initialisation for held-out subject (original paper)
+    reptile_lora           — Euclidean Reptile meta-initialisation
+    reptile_lora_grassmann — Riemannian Reptile on Grassmann manifold G(r,n)
+
+The Grassmann condition is identical to reptile_lora in all hyperparameters,
+training loop, and evaluation. Only the meta-update geometry differs — A matrices
+are averaged on the Grassmann manifold rather than in Euclidean space.
 
 LOSO evaluation:
-    Train on subjects {1..9} \ {held_out}
+    Train on subjects {1..9} \\ {held_out}
     Evaluate on held_out subject:
         zero_shot:    no calibration trials, no fine-tuning
         few_shot_N5:  fine-tune on 5  calibration trials
@@ -31,7 +41,11 @@ sys.path.insert(0, '../EEGNex')
 
 from data_utils import load_dataset, build_loso_split
 from baseline_trainer import build_baseline_model, train_baseline
-from reptile_trainer import build_reptile_model, train_reptile
+from reptile_trainer import (
+    build_reptile_model,
+    train_reptile,
+    train_reptile_grassmann,
+)
 from evaluate import run_full_evaluation
 from meta_init import LORA_LAYER_NAMES
 
@@ -61,6 +75,9 @@ DEFAULT_CONFIG = {
     # Reptile outer update
     'meta_lr': 0.1,
 }
+
+# Valid conditions
+CONDITIONS = ['baseline_lora', 'reptile_lora', 'reptile_lora_grassmann']
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -121,10 +138,10 @@ def main(args):
         'n_classes':  n_classes,
     })
 
-    # Held-out subject uses the slot after all training subjects
     held_out_slot = n_train_subjects
 
     # ── Build model and train ──────────────────────────────────────────────────
+
     if args.condition == 'baseline_lora':
         print(f'\n=== BASELINE LoRA ({args.dataset}) ===')
         print('Held-out subject initialised from ZERO (original paper behaviour)')
@@ -143,8 +160,9 @@ def main(args):
         print(f'\nHeld-out slot {held_out_slot} remains at zero initialisation')
 
     elif args.condition == 'reptile_lora':
-        print(f'\n=== REPTILE LoRA ({args.dataset}) ===')
-        print('Held-out subject will be initialised from A_meta, B_meta')
+        print(f'\n=== REPTILE LoRA — Euclidean ({args.dataset}) ===')
+        print('Meta-update: Euclidean average in R^(n×r)')
+        print('Held-out subject initialised from A_meta, B_meta')
 
         model = build_reptile_model(
             n_channels, n_classes, n_times,
@@ -167,11 +185,41 @@ def main(args):
             meta_init.weights[name]['B'].norm().item()
             for name in LORA_LAYER_NAMES
         )
+        print(f'Meta-init total Euclidean norm: {total_norm:.4f}')
+        wandb.log({'meta_init_norm': total_norm})
+
+    elif args.condition == 'reptile_lora_grassmann':
+        print(f'\n=== REPTILE LoRA — Grassmann ({args.dataset}) ===')
+        print('Meta-update: Riemannian Reptile on G(r, n) for A matrices')
+        print('Held-out subject initialised from A_meta (Grassmann), B_meta (Euclidean)')
+
+        model = build_reptile_model(
+            n_channels, n_classes, n_times,
+            n_train_subjects, cfg, device,
+        )
+
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f'Trainable parameters: {n_params:,}')
+        wandb.log({'n_params': n_params})
+
+        model, meta_init = train_reptile_grassmann(
+            model, train_X, train_y, train_sids, cfg, device
+        )
+
+        print(f'\nLoading Grassmann A_meta, B_meta into held-out slot {held_out_slot}')
+        meta_init.load_into_slot(model, held_out_slot)
+
+        total_norm = sum(
+            meta_init.weights[name]['A'].norm().item() +
+            meta_init.weights[name]['B'].norm().item()
+            for name in LORA_LAYER_NAMES
+        )
         print(f'Meta-init total norm: {total_norm:.4f}')
         wandb.log({'meta_init_norm': total_norm})
 
     else:
-        raise ValueError(f'Unknown condition: {args.condition}')
+        raise ValueError(f'Unknown condition: {args.condition}. '
+                         f'Choose from: {CONDITIONS}')
 
     # ── Evaluate ───────────────────────────────────────────────────────────────
     print(f'\n=== Evaluation on held-out subject {args.held_out} ({args.dataset}) ===')
@@ -212,7 +260,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--condition', type=str, required=True,
-                        choices=['baseline_lora', 'reptile_lora'])
+                        choices=CONDITIONS)
     parser.add_argument('--dataset',   type=str, default='BCI2a',
                         choices=['BCI2a', 'BCI2b'])
     parser.add_argument('--held_out',  type=int, required=True,
