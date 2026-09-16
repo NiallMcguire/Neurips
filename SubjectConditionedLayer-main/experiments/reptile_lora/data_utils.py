@@ -153,6 +153,56 @@ def build_loso_split(data, labels, subject_ids, sessions,
             test_X, test_y, test_sids)
 
 
+# ── Euclidean Alignment (He & Wu, 2020) ───────────────────────────────────────
+
+def euclidean_align(data, subject_ids, sessions=None, dataset='BCI2a',
+                    eps=1e-6):
+    """
+    Euclidean Alignment: whiten each subject's trials by the inverse
+    square root of their mean trial covariance, so all subjects share
+    a common covariance frame. Uses unlabelled data only — the zero-shot
+    claim is preserved (no labels are consumed).
+
+    IMPORTANT (leakage fix): the whitening transform for each subject is
+    estimated ONLY on that subject's TRAIN sessions (when `sessions` and
+    `dataset` are provided), then applied to all of that subject's
+    trials (train + test). This prevents the held-out subject's test
+    trials from influencing the transform applied to them. If `sessions`
+    is None, falls back to using all trials per subject (legacy).
+
+    data:        (N, C, T) numpy array
+    subject_ids: (N,) 0-indexed subject ids
+    sessions:    (N,) session labels (optional, for train-only fitting)
+    dataset:     dataset name to look up train session labels
+    Returns aligned (N, C, T) array (float32).
+    """
+    aligned = np.empty_like(data, dtype=np.float32)
+    train_sessions = None
+    if sessions is not None:
+        train_sessions = DATASET_SESSIONS[dataset]['train']
+
+    for sid in np.unique(subject_ids):
+        mask   = subject_ids == sid
+        trials = data[mask]
+        # Fit covariance on train sessions only when available
+        if train_sessions is not None:
+            fit_mask = mask & np.isin(sessions, train_sessions)
+            fit_trials = data[fit_mask]
+            if len(fit_trials) == 0:
+                fit_trials = trials
+        else:
+            fit_trials = trials
+        # Mean covariance across fit trials
+        covs   = np.stack([np.cov(t) for t in fit_trials])
+        M      = covs.mean(axis=0)
+        # Regularise and compute M^{-1/2} via eigendecomposition
+        M     += eps * np.trace(M) / M.shape[0] * np.eye(M.shape[0])
+        eigvals, eigvecs = np.linalg.eigh(M)
+        inv_sqrt = eigvecs @ np.diag(eigvals ** -0.5) @ eigvecs.T
+        aligned[mask] = np.einsum('cj,njt->nct', inv_sqrt, trials)
+    return aligned
+
+
 # ── Per-subject dict for Reptile inner loop ───────────────────────────────────
 
 def build_per_subject_dict(train_X, train_y, train_sids):

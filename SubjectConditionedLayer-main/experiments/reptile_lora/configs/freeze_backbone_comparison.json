@@ -1,0 +1,27 @@
+{
+  "experiment": "freeze_backbone_comparison",
+  "description": "Backbone-frozen arms for both baseline and reptile conditions (reviewer 8 + brief: backbone should be frozen). Run with --freeze_backbone. Uses run_experiment.py directly or extend run_reptile.sh with the flag. Compares adapter-only training against the trunk already encoding population information.",
+  "config": {
+    "freq_min": 8,
+    "freq_max": 45,
+    "rank": 8,
+    "alpha": 24,
+    "epochs": 100,
+    "batch_size": 64,
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "freeze_backbone": true,
+    "meta_layers": null,
+    "inner_steps": 5,
+    "inner_lr": 0.01,
+    "inner_batch": 32,
+    "meta_lr": 0.1
+  },
+  "conditions": ["baseline_lora", "reptile_lora"],
+  "datasets": ["BCI2a", "BCI2b"],
+  "held_out": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "seeds": [1, 2, 3, 4, 5],
+  "freeze_backbone": true,
+  "runner": "run_experiment.py --freeze_backbone",
+  "wandb_project": "reptile_lora_bci"
+}

@@ -1,0 +1,16 @@
+{
+  "experiment": "hypernetwork_conditional_init",
+  "description": "Phase 3 method contribution: amortised per-subject adapter init theta_s = H(c_s). H is an AdapterHypernetwork emitting (A,B) factors per layer from a 2*n_channels context descriptor (per-channel log-variance + log-covariance eigenvalues), trained by regression onto the trained per-subject adapters of a baseline model. Held-out init is a single forward pass H(c_heldout) using unlabelled calibration+test trials for the context. Runner: run_experiment.py --condition hypernet.",
+  "config": {
+    "freq_min": 8, "freq_max": 45, "rank": 8, "alpha": 24,
+    "epochs": 100, "batch_size": 64, "lr": 0.001, "weight_decay": 0.01,
+    "freeze_backbone": false, "meta_layers": null,
+    "hn_epochs": 200, "hn_lr": 0.001, "hn_hidden": 256
+  },
+  "conditions": ["hypernet"],
+  "datasets": ["BCI2a", "BCI2b"],
+  "held_out": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "seeds": [1, 2, 3, 4, 5],
+  "note": "This is the performance-oriented arm: replaces the single Reptile centroid with a per-subject predicted init, targeting outlier subjects (S7 on 2a, S8 on 2b) that the centroid harms. Distilled targets (distill.py) are an optional gated upgrade to the regression targets.",
+  "wandb_project": "reptile_lora_bci"
+}

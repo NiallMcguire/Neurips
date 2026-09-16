@@ -103,18 +103,25 @@ def evaluate_few_shot(model, cal_X, cal_y, test_X, test_y,
     # Freeze everything except this subject's adapter
     freeze_backbone(model_copy)
 
-    # Subsample N calibration trials — stratified by class
+    # Subsample N calibration trials — stratified by class, exactly N.
+    # Use a seeded RNG for reproducibility across invocations.
     n_classes = len(np.unique(cal_y))
     if N >= len(cal_X):
         idx = np.arange(len(cal_X))
     else:
+        rng = np.random.default_rng(seed=0)  # fixed: calibration set is a
+                                             # protocol constant, not a
+                                             # source of run-to-run variance
+        classes = np.unique(cal_y)
+        base = N // n_classes
+        rem  = N % n_classes
         idx = []
-        for cls in np.unique(cal_y):
+        for i, cls in enumerate(classes):
             cls_idx = np.where(cal_y == cls)[0]
-            n_cls   = max(1, N // n_classes)
-            chosen  = np.random.choice(cls_idx,
-                                       size=min(n_cls, len(cls_idx)),
-                                       replace=False)
+            n_cls   = base + (1 if i < rem else 0)  # distribute remainder
+            chosen  = rng.choice(cls_idx,
+                                 size=min(n_cls, len(cls_idx)),
+                                 replace=False)
             idx.extend(chosen.tolist())
         idx = np.array(idx)
 

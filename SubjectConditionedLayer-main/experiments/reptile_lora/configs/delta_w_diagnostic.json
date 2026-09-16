@@ -1,0 +1,17 @@
+{
+  "experiment": "delta_w_heterogeneity_diagnostic",
+  "description": "The intended contribution: between-vs-within subject distance ratio on effective weight deltas DeltaW = (alpha/r) * B . A per adapted layer, before and after Euclidean Alignment. Consumes checkpoints saved by run_experiment.py (checkpoints/ dir). Requires multi-seed runs per subject so within-subject spread (same subject, different seeds) can be computed as the noise floor. See delta_w_diagnostics.py and run_diagnostic.sh.",
+  "metric": {
+    "within_spread": "mean distance from each seed's DeltaW to its subject centroid (noise floor)",
+    "between_spread": "mean pairwise distance between subject centroids (signal)",
+    "ratio": "between / within; ~1 => centroid fine, >>1 => centroid structurally wrong"
+  },
+  "inputs": "checkpoints/{condition}_{dataset}_heldout{h}_seed{s}.pt",
+  "layer_names": ["block_1_1", "block_2_0", "block_4_1", "block_5_0"],
+  "runs_needed": {
+    "pre_ea": "reptile_lora or baseline_lora, all 9 subjects, 5 seeds, no --ea",
+    "post_ea": "same with --ea"
+  },
+  "runner": "run_diagnostic.sh",
+  "output": "delta_w_diagnostic.json"
+}

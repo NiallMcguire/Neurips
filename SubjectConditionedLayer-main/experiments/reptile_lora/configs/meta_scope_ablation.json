@@ -1,0 +1,31 @@
+{
+  "experiment": "meta_scope_ablation",
+  "description": "Reviewer request 5: ablate which parameters are meta-learned. meta_layers=null means the default 4 conv adapters (block_1_1, block_2_0, block_4_1, block_5_0). To extend to batch-norm and classifier, pass an explicit layer list to MetaInit and ensure those layers expose lora_A/lora_B or are handled by the scope flag. This config documents the axis; the BN/classifier adapters require additional model plumbing (see notes).",
+  "config": {
+    "freq_min": 8,
+    "freq_max": 45,
+    "rank": 8,
+    "alpha": 24,
+    "epochs": 100,
+    "batch_size": 64,
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "freeze_backbone": false,
+    "meta_layers": ["block_1_1", "block_2_0", "block_4_1", "block_5_0"],
+    "inner_steps": 5,
+    "inner_lr": 0.01,
+    "inner_batch": 32,
+    "meta_lr": 0.1
+  },
+  "meta_layer_sets": {
+    "conv_only": ["block_1_1", "block_2_0", "block_4_1", "block_5_0"],
+    "conv_plus_bn": ["block_1_1", "block_2_0", "block_4_1", "block_5_0", "block_3_1", "block_5_1"],
+    "conv_plus_classifier": ["block_1_1", "block_2_0", "block_4_1", "block_5_0", "final_layer"]
+  },
+  "note": "BN and classifier layers do not yet have per-subject LoRA adapters; meta_layers scope flag is wired for the conv adapters and the plumbing in meta_init.get_adapter_params/freeze_backbone accepts arbitrary layer names, but adding adapters to BN/classifier is a model-side change in EEGNeX.py.",
+  "conditions": ["reptile_lora"],
+  "datasets": ["BCI2a"],
+  "held_out": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "seeds": [1, 2, 3, 4, 5],
+  "wandb_project": "reptile_lora_bci"
+}

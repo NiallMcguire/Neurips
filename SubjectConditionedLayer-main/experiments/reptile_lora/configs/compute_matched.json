@@ -1,0 +1,15 @@
+{
+  "experiment": "compute_matched_control",
+  "description": "Reviewer 2 fairness control. Baseline joint training plus extra joint-training gradient steps equal to the Reptile arm's inner-loop spend (n_train_subjects * inner_steps * epochs when update_freq=0). Held-out slot stays at zero-init. If this arm does not match reptile_lora's accuracy, the meta-init gain is not merely a compute artefact. Runner: run_experiment.py --condition compute_matched.",
+  "config": {
+    "freq_min": 8, "freq_max": 45, "rank": 8, "alpha": 24,
+    "epochs": 100, "batch_size": 64, "lr": 0.001, "weight_decay": 0.01,
+    "freeze_backbone": false, "meta_layers": null,
+    "inner_steps": 5
+  },
+  "conditions": ["compute_matched"],
+  "datasets": ["BCI2a", "BCI2b"],
+  "held_out": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "seeds": [1, 2, 3, 4, 5],
+  "wandb_project": "reptile_lora_bci"
+}

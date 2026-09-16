@@ -1,0 +1,16 @@
+{
+  "experiment": "maml_baseline",
+  "description": "MAML (second-order) meta-init baseline, reviewer request 1. Functional inner loop via torch.func.functional_call; backbone trained jointly with AdamW; meta-step once per epoch over all subjects. Same LOSO protocol. Runner: run_phase3.sh or run_experiment.py --condition maml.",
+  "config": {
+    "freq_min": 8, "freq_max": 45, "rank": 8, "alpha": 24,
+    "epochs": 100, "batch_size": 64, "lr": 0.001, "weight_decay": 0.01,
+    "freeze_backbone": false, "meta_layers": null,
+    "inner_steps": 5, "inner_lr": 0.01, "inner_batch": 32, "meta_lr": 0.001
+  },
+  "conditions": ["maml"],
+  "datasets": ["BCI2a", "BCI2b"],
+  "held_out": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "seeds": [1, 2, 3, 4, 5],
+  "note": "meta_lr for MAML is an Adam LR on the meta-params (default 1e-3), unlike Reptile's meta_lr which is an interpolation coefficient (default 0.1).",
+  "wandb_project": "reptile_lora_bci"
+}

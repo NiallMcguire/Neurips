@@ -37,7 +37,8 @@ sys.path.insert(0, '../EEGNex')
 from EEGNeX import EEGNeX
 
 from data_utils import EEGDataset, build_per_subject_dict
-from meta_init import MetaInit, get_adapter_params, LORA_LAYER_NAMES
+from meta_init import MetaInit, get_adapter_params, LORA_LAYER_NAMES, freeze_backbone
+from exposure import ExposureTracker
 
 
 def build_reptile_model(n_channels, n_classes, n_times,
@@ -57,7 +58,7 @@ def build_reptile_model(n_channels, n_classes, n_times,
 # ── Inner loop (shared by both Euclidean and Grassmann trainers) ──────────────
 
 def inner_loop(model, meta_init, subject_slot, X_s, y_s,
-               K, inner_lr, inner_batch, device):
+               K, inner_lr, inner_batch, device, tracker=None):
     """
     Run K SGD steps on subject s starting from meta-init.
     Returns phi_K — the adapted adapter weights.
@@ -83,6 +84,8 @@ def inner_loop(model, meta_init, subject_slot, X_s, y_s,
         loss.backward()
         torch.nn.utils.clip_grad_norm_(adapter_params, 1.0)
         inner_opt.step()
+        if tracker is not None:
+            tracker.record_inner_step(len(idx), subject_slot)
 
     return meta_init.extract_from_slot(model, subject_slot)
 
@@ -90,7 +93,7 @@ def inner_loop(model, meta_init, subject_slot, X_s, y_s,
 # ── Euclidean Reptile step and trainer (original, unchanged) ──────────────────
 
 def reptile_step(model, meta_init, subject_data,
-                 K, inner_lr, inner_batch, meta_lr, device):
+                 K, inner_lr, inner_batch, meta_lr, device, tracker=None):
     """
     Run inner loop for all training subjects and apply Euclidean Reptile update.
     Returns delta_norm for logging.
@@ -98,11 +101,13 @@ def reptile_step(model, meta_init, subject_data,
     phi_list = []
     for sid, (X_s, y_s) in subject_data.items():
         phi = inner_loop(model, meta_init, sid,
-                         X_s, y_s, K, inner_lr, inner_batch, device)
+                         X_s, y_s, K, inner_lr, inner_batch, device, tracker)
         phi_list.append(phi)
 
     delta_norm = meta_init.delta_norm(phi_list)
     meta_init.reptile_update(phi_list, meta_lr)
+    if tracker is not None:
+        tracker.record_reptile_update()
     return delta_norm
 
 
@@ -118,16 +123,26 @@ def train_reptile(model, train_X, train_y, train_sids, config, device):
     down so total inner-loop steps per epoch stays constant.
     """
     subject_data = build_per_subject_dict(train_X, train_y, train_sids)
-    meta_init    = MetaInit(model, device)
+    meta_init    = MetaInit(model, device,
+                            layer_names=config.get('meta_layers', None))
 
     dataset = EEGDataset(train_X, train_y, train_sids)
     loader  = DataLoader(dataset, batch_size=config['batch_size'],
                          shuffle=True, drop_last=True, num_workers=1)
 
     criterion = nn.CrossEntropyLoss()
-    outer_opt = torch.optim.AdamW(model.parameters(),
-                                   lr=config['lr'],
-                                   weight_decay=config['weight_decay'])
+
+    if config.get('freeze_backbone', False):
+        freeze_backbone(model)
+        print('Backbone frozen — training adapters only')
+
+    outer_opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=config['lr'],
+        weight_decay=config['weight_decay'])
+
+    tracker = ExposureTracker()
+    tracker.start()
 
     K            = config['inner_steps']
     inner_lr     = config['inner_lr']
@@ -172,11 +187,12 @@ def train_reptile(model, train_X, train_y, train_sids, config, device):
             correct    += (logits.argmax(1) == y_batch).sum().item()
             n          += len(y_batch)
             global_step += 1
+            tracker.record_backbone_step(len(y_batch), sid_batch.cpu().numpy())
 
             if update_freq > 0 and global_step % update_freq == 0:
                 dn = reptile_step(model, meta_init, subject_data,
                                   K_actual, inner_lr, inner_batch,
-                                  meta_lr, device)
+                                  meta_lr, device, tracker)
                 epoch_delta_norm += dn
                 reptile_count    += 1
 
@@ -186,7 +202,7 @@ def train_reptile(model, train_X, train_y, train_sids, config, device):
         if update_freq == 0:
             dn = reptile_step(model, meta_init, subject_data,
                               K_actual, inner_lr, inner_batch,
-                              meta_lr, device)
+                              meta_lr, device, tracker)
             epoch_delta_norm = dn
             reptile_count    = 1
 
@@ -205,7 +221,8 @@ def train_reptile(model, train_X, train_y, train_sids, config, device):
             'K_actual':        K_actual,
         })
 
-    return model, meta_init
+    wandb.log(tracker.summary())
+    return model, meta_init, tracker
 
 
 # ── Grassmann Reptile step and trainer (new) ──────────────────────────────────

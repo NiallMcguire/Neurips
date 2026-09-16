@@ -34,8 +34,14 @@ from grassmann_utils import (
 )
 
 
-# Names of the four LoRA layers in EEGNeX LoRA mode
+# Default names of the four LoRA layers in EEGNeX LoRA mode.
+# Overridable per-run via MetaInit(model, device, layer_names=...)
+# (reviewer request: ablate which parameters are meta-learned).
 LORA_LAYER_NAMES = ['block_1_1', 'block_2_0', 'block_4_1', 'block_5_0']
+
+
+def _resolve_layer_names(layer_names):
+    return list(layer_names) if layer_names is not None else list(LORA_LAYER_NAMES)
 
 
 class MetaInit:
@@ -50,17 +56,18 @@ class MetaInit:
     and can be compared by passing the same MetaInit to different trainers.
     """
 
-    def __init__(self, model, device):
+    def __init__(self, model, device, layer_names=None):
         """
         Initialise meta weights by copying the initial adapter weights
         from adapter slot 0 of the model.
         B weights start at zero (matching existing initialisation).
         A weights start at N(0, 0.02) (matching existing initialisation).
         """
-        self.device = device
+        self.device      = device
+        self.layer_names = _resolve_layer_names(layer_names)
         self.weights = {}   # {layer_name: {'A': tensor, 'B': tensor}}
 
-        for name in LORA_LAYER_NAMES:
+        for name in self.layer_names:
             layer = getattr(model, name)
             # Copy from slot 0 — shapes are identical across slots
             self.weights[name] = {
@@ -76,7 +83,7 @@ class MetaInit:
         Used at the start of each inner loop iteration and at test time.
         """
         with torch.no_grad():
-            for name in LORA_LAYER_NAMES:
+            for name in self.layer_names:
                 layer = getattr(model, name)
                 layer.lora_A[slot].weight.data.copy_(self.weights[name]['A'])
                 layer.lora_B[slot].weight.data.copy_(self.weights[name]['B'])
@@ -88,7 +95,7 @@ class MetaInit:
         Returns a dict with same structure as self.weights.
         """
         phi = {}
-        for name in LORA_LAYER_NAMES:
+        for name in self.layer_names:
             layer = getattr(model, name)
             phi[name] = {
                 'A': layer.lora_A[slot].weight.data.clone(),
@@ -110,7 +117,8 @@ class MetaInit:
         """
         n = len(phi_list)
         with torch.no_grad():
-            for name in LORA_LAYER_NAMES:
+            for name in self.layer_names:
+                # Average delta across subjects
                 delta_A = sum(
                     phi[name]['A'] - self.weights[name]['A']
                     for phi in phi_list
@@ -131,7 +139,7 @@ class MetaInit:
         """
         n = len(phi_list)
         total = 0.0
-        for name in LORA_LAYER_NAMES:
+        for name in self.layer_names:
             delta_A = sum(
                 phi[name]['A'] - self.weights[name]['A']
                 for phi in phi_list
@@ -267,35 +275,34 @@ class MetaInit:
         to confirm zero-initialisation matches original paper behaviour.
         """
         with torch.no_grad():
-            for name in LORA_LAYER_NAMES:
+            for name in self.layer_names:
                 self.weights[name]['A'].zero_()
                 self.weights[name]['B'].zero_()
 
 
-# ── Parameter helpers (unchanged) ─────────────────────────────────────────────
-
-def get_adapter_params(model, slot):
+def get_adapter_params(model, slot, layer_names=None):
     """
     Return all adapter parameters for a given slot as a list.
     Used to build an optimiser that only updates one subject's adapters.
     """
     params = []
-    for name in LORA_LAYER_NAMES:
+    for name in _resolve_layer_names(layer_names):
         layer = getattr(model, name)
         params.append(layer.lora_A[slot].weight)
         params.append(layer.lora_B[slot].weight)
     return params
 
 
-def freeze_backbone(model):
+def freeze_backbone(model, layer_names=None):
     """
     Freeze all parameters except LoRA adapters.
     Used during few-shot adaptation at test time.
     """
+    names = _resolve_layer_names(layer_names)
     for name, param in model.named_parameters():
         is_adapter = any(
             f'{lname}.lora_A' in name or f'{lname}.lora_B' in name
-            for lname in LORA_LAYER_NAMES
+            for lname in names
         )
         param.requires_grad = is_adapter
 
