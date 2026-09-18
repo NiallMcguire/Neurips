@@ -102,7 +102,7 @@ DEFAULT_CONFIG = {
 CONDITIONS = ['baseline_lora', 'reptile_lora', 'reptile_lora_grassmann',
               'average_adapters', 'shared_adapter',
               'donor_random', 'donor_nearest',
-              'compute_matched', 'maml', 'hypernet']
+              'compute_matched', 'maml', 'hypernet', 'hypernet_distill']
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -120,6 +120,7 @@ def main(args):
     cfg = DEFAULT_CONFIG.copy()
     if args.freeze_backbone:
         cfg['freeze_backbone'] = True
+    cfg['ea'] = bool(args.ea)   # record EA in config so runs are distinguishable
 
     # meta_lr semantics differ by condition: Reptile uses it as an
     # interpolation coefficient (default 0.1), while MAML uses it as an
@@ -133,9 +134,12 @@ def main(args):
     held_out_0idx = args.held_out - 1
 
     # ── WandB ─────────────────────────────────────────────────────────────────
+    run_name = f'{args.condition}_{args.dataset}_heldout{args.held_out}_seed{args.seed}'
+    if args.ea:
+        run_name += '_ea'
     wandb.init(
         project='reptile_lora_bci',
-        name=f'{args.condition}_{args.dataset}_heldout{args.held_out}_seed{args.seed}',
+        name=run_name,
         config={**cfg,
                 'condition': args.condition,
                 'dataset':   args.dataset,
@@ -385,10 +389,11 @@ def main(args):
                                meta_init=meta_init, device=device)
         wandb.log({'init': 'maml_init'})
 
-    elif args.condition == 'hypernet':
+    elif args.condition in ('hypernet', 'hypernet_distill'):
         if not _HAS_HN:
             raise RuntimeError('hypernet unavailable')
-        print(f'\n=== HYPERNETWORK LoRA ({args.dataset}) ===')
+        distill = args.condition == 'hypernet_distill'
+        print(f'\n=== HYPERNETWORK LoRA distill={distill} ({args.dataset}) ===')
         # Train a joint baseline model, then train H to regress onto the
         # trained per-subject adapters, then init held-out from H(c_heldout).
         model = build_baseline_model(
@@ -420,6 +425,72 @@ def main(args):
                     'B': layer.lora_B[s].weight.data.clone(),
                 }
 
+        # Optional gated distillation: improve each subject's target adapter
+        # by distilling a per-subject teacher, only where the teacher beats
+        # the plain hard-label adapter on that subject's held-out data.
+        if distill:
+            from distill import (distill_teacher_into_adapter,
+                                 teacher_beats_hardlabel)
+            from meta_init import get_adapter_params, freeze_backbone, unfreeze_all
+            from evaluate import run_eval
+            import copy
+            n_distilled = 0
+            for s in np.unique(train_sids):
+                s = int(s)
+                X_s = train_X[train_sids == s]
+                y_s = train_y[train_sids == s]
+                # Split subject data: fit teacher on first 80%, gate on last 20%
+                n_cut = max(1, int(0.8 * len(X_s)))
+                X_tr, y_tr = X_s[:n_cut], y_s[:n_cut]
+                X_ho, y_ho = X_s[n_cut:], y_s[n_cut:]
+                if len(X_ho) == 0:
+                    X_ho, y_ho = X_tr, y_tr
+
+                # Hard-label adapter accuracy (current slot s as trained)
+                hl_acc, _, _, _ = run_eval(model, X_ho, y_ho, s, device)
+
+                # Teacher: fine-tune a high-rank copy of this subject's adapter
+                teacher = copy.deepcopy(model).to(device)
+                freeze_backbone(teacher, layer_names)
+                tparams = get_adapter_params(teacher, s, layer_names)
+                topt = torch.optim.AdamW(tparams, lr=1e-3)
+                crit = torch.nn.CrossEntropyLoss()
+                teacher.train()
+                for _ in range(cfg.get('teacher_steps', 100)):
+                    idx = np.random.choice(len(X_tr), min(32, len(X_tr)),
+                                           replace=len(X_tr) < 32)
+                    Xb = torch.from_numpy(X_tr[idx]).float().to(device)
+                    yb = torch.from_numpy(y_tr[idx]).long().to(device)
+                    sid = torch.full((len(idx),), s, dtype=torch.long,
+                                     device=device)
+                    topt.zero_grad()
+                    loss = crit(teacher(Xb, sid), yb)
+                    loss.backward()
+                    topt.step()
+                t_acc, _, _, _ = run_eval(teacher, X_ho, y_ho, s, device)
+
+                # Gate: only distill if teacher beats hard-label adapter
+                if teacher_beats_hardlabel(t_acc, hl_acc):
+                    def teacher_fn(Xb, _t=teacher, _s=s):
+                        sid = torch.full((len(Xb),), _s, dtype=torch.long,
+                                         device=device)
+                        return _t(Xb, sid)
+                    distill_teacher_into_adapter(
+                        model, teacher_fn, X_tr, s,
+                        layer_names=layer_names, device=device,
+                        steps=cfg.get('distill_steps', 200))
+                    # Update regression target to the distilled adapter
+                    for name in layer_names:
+                        layer = getattr(model, name)
+                        targets[s][name] = {
+                            'A': layer.lora_A[s].weight.data.clone(),
+                            'B': layer.lora_B[s].weight.data.clone(),
+                        }
+                    n_distilled += 1
+                del teacher
+            print(f'  Distilled {n_distilled}/{n_train_subjects} subject targets')
+            wandb.log({'n_distilled': n_distilled})
+
         hypernet = AdapterHypernetwork(
             model, layer_names=layer_names, n_channels=n_channels,
             device=device)
@@ -432,7 +503,7 @@ def main(args):
         # of the held-out subject) — never test data.
         held_ctx = subject_context(cal_X)
         hypernet.load_into_slot(model, held_out_slot, held_ctx)
-        init_info = {'init': 'hypernetwork'}
+        init_info = {'init': 'hypernetwork_distill' if distill else 'hypernetwork'}
         wandb.log(init_info)
 
     else:
