@@ -1,25 +1,50 @@
 #!/bin/bash
 #=================================================================
-# ΔW heterogeneity diagnostic.
+# ΔW heterogeneity diagnostic driver (Fix 2): computes between/within
+# subject distance ratio on effective deltas, raw and (optionally)
+# distilled, before and after EA. Reads checkpoints produced by the
+# baseline/reptile sweeps.
 #
-# Prerequisites: multi-seed LOSO runs already completed (checkpoints/).
-# The diagnostic needs per-subject adapters across seeds, so run the
-# full sweeps first (run_reptile.sh and run_ea_ablation.sh).
-#
-# This script is a placeholder driver — the diagnostic logic lives in
-# delta_w_diagnostics.py. Extend that script's main() to reconstruct
-# models from checkpoints and call spread_metrics on pre/post-EA runs.
+# Array of 8: dataset(2) x distill(2) x ea(2). condition=baseline_lora
+# (per-subject adapters exist for all training subjects).
 #=================================================================
 
-set -e
+#SBATCH --export=ALL
+#SBATCH --partition=gpu --gpus=1 --mem-per-cpu=36000
+#SBATCH --account=moshfeghi-pmwc
+#SBATCH --time=12:00:00
+#SBATCH --mail-user=niall.mcguire@strath.ac.uk
+#SBATCH --mail-type=END,FAIL
+#SBATCH --job-name=delta_w_diag
+#SBATCH --output=logs/diag_%A_%a.out
+#SBATCH --array=0-7
+
+module purge
+module load nvidia/sdk/23.3
+module load anaconda/python-3.9.7/2021.11
+
+source /users/gxb18167/Neurips/SubjectConditionedLayer-main/venv_sulora/bin/activate
 cd /users/gxb18167/Neurips/SubjectConditionedLayer-main/experiments/reptile_lora
-source ../../venv_sulora/bin/activate
+mkdir -p logs diagnostics
 
-echo "Checkpoints available:"
-ls checkpoints/*.pt 2>/dev/null | head -20 || echo "  (none yet — run the sweeps first)"
+DATASETS=("BCI2a" "BCI2b")
+T=${SLURM_ARRAY_TASK_ID}
+DS=${DATASETS[$(( T / 4 ))]}
+REM=$(( T % 4 ))
+DISTILL=$(( REM / 2 ))
+EA=$(( REM % 2 ))
 
-python delta_w_diagnostics.py \
-    --checkpoints checkpoints/*.pt \
-    --out delta_w_diagnostic.json
+ARGS="--dataset ${DS} --condition baseline_lora --seeds 1 2 3 4 5"
+[ ${DISTILL} -eq 1 ] && ARGS="${ARGS} --distill"
+[ ${EA} -eq 1 ] && ARGS="${ARGS} --ea"
+OUT="diagnostics/diag_${DS}_distill${DISTILL}_ea${EA}.json"
+ARGS="${ARGS} --out ${OUT}"
 
-echo "Diagnostic written to delta_w_diagnostic.json"
+echo "=== Task ${T}: ${DS} distill=${DISTILL} ea=${EA} -> ${OUT} ==="
+python delta_w_diagnostics.py ${ARGS}
+
+EXIT_CODE=$?
+echo "Exit code: ${EXIT_CODE}"
+/opt/software/scripts/job_epilogue.sh
+exit ${EXIT_CODE}
+
