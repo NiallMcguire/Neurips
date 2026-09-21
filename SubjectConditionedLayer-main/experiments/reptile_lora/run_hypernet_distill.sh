@@ -19,8 +19,9 @@
 
 module purge
 module load nvidia/sdk/23.3
-module load anaconda/python-3.9.7/2021.11
 
+# Use the project venv directly; the anaconda module is not present on all
+# GPU nodes and its absence was causing job failures.
 source /users/gxb18167/Neurips/SubjectConditionedLayer-main/venv_sulora/bin/activate
 cd /users/gxb18167/Neurips/SubjectConditionedLayer-main/experiments/reptile_lora
 mkdir -p logs
