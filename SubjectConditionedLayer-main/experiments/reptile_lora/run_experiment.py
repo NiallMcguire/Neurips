@@ -531,8 +531,9 @@ def main(args):
 
     # ── Save checkpoint for downstream diagnostics ─────────────────────────────
     os.makedirs('checkpoints', exist_ok=True)
+    ea_suffix = '_ea' if args.ea else ''
     ckpt_path = (f'checkpoints/{args.condition}_{args.dataset}'
-                 f'_heldout{args.held_out}_seed{args.seed}.pt')
+                 f'_heldout{args.held_out}_seed{args.seed}{ea_suffix}.pt')
     torch.save({
         'state_dict':  model.state_dict(),
         'condition':   args.condition,
@@ -540,6 +541,10 @@ def main(args):
         'held_out':    args.held_out,
         'seed':        args.seed,
         'n_train_subjects': n_train_subjects,
+        'n_channels':      n_channels,
+        'n_times':         n_times,
+        'n_classes':       n_classes,
+        'ea':              bool(args.ea),
         'config':      cfg,
     }, ckpt_path)
     print(f'\nCheckpoint saved to {ckpt_path}')

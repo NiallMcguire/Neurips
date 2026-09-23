@@ -131,15 +131,17 @@ def permutation_chance_bound(model_eval_fn, X, y, slot, n_perm=1000, rng=None):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def _reconstruct_model(ckpt, device):
+def _reconstruct_model(ckpt, device, n_times=None):
     """Rebuild an EEGNeX LoRA model from a saved checkpoint."""
     import sys
     sys.path.insert(0, '../EEGNex')
     from EEGNeX import EEGNeX
     cfg = ckpt['config']
-    n_ch = 22 if ckpt['dataset'] == 'BCI2a' else 3
-    n_cls = 4 if ckpt['dataset'] == 'BCI2a' else 2
-    n_times = 512
+    n_ch = ckpt.get('n_channels', 22 if ckpt['dataset'] == 'BCI2a' else 3)
+    n_cls = ckpt.get('n_classes', 4 if ckpt['dataset'] == 'BCI2a' else 2)
+    n_times = ckpt.get('n_times', n_times)
+    if n_times is None:
+        raise ValueError('Checkpoint lacks n_times; rerun training with the current checkpoint format')
     model = EEGNeX(
         n_chans=n_ch, n_outputs=n_cls, n_times=n_times,
         mode='LoRA', rank=cfg['rank'], alpha=cfg['alpha'],
@@ -251,13 +253,14 @@ def main():
     all_raw = {}
     all_distilled = {}
     for seed in args.seeds:
+        suffix = '_ea' if args.ea else ''
         path = (f'checkpoints/{args.condition}_{args.dataset}'
-                f'_heldout{args.held_out}_seed{seed}.pt')
+            f'_heldout{args.held_out}_seed{seed}{suffix}.pt')
         if not os.path.exists(path):
             print(f'MISSING {path}, skipping')
             continue
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        model, cfg = _reconstruct_model(ckpt, device)
+        model, cfg = _reconstruct_model(ckpt, device, n_times=data.shape[2])
         n_train = ckpt['n_train_subjects']
         slots = list(range(n_train))  # training subjects only, not held-out slot
 
