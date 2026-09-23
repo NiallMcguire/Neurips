@@ -9,7 +9,7 @@ Does not modify any existing module. Reuses, unmodified:
     reptile_trainer.{build_reptile_model, train_reptile}
     meta_init.{get_adapter_params, freeze_backbone, unfreeze_all,
                LORA_LAYER_NAMES}
-    inits.{delta_w, init_average, apply_init, subject_covariances}
+    inits.{delta_w, load_delta_w_into_slot, apply_init, subject_covariances}
     hypernet.{subject_context, AdapterHypernetwork, context_dim}
     evaluate.{N_ADAPT_STEPS, ADAPT_LR, ADAPT_BATCH}
     run_experiment.DEFAULT_CONFIG
@@ -92,7 +92,7 @@ from baseline_trainer import build_baseline_model, train_baseline
 from reptile_trainer import build_reptile_model, train_reptile
 from meta_init import (get_adapter_params, freeze_backbone, unfreeze_all,
                        LORA_LAYER_NAMES)
-from inits import delta_w, init_average, apply_init, subject_covariances
+from inits import delta_w, load_delta_w_into_slot, apply_init, subject_covariances
 from hypernet import subject_context, AdapterHypernetwork, context_dim
 from evaluate import N_ADAPT_STEPS, ADAPT_LR, ADAPT_BATCH
 from run_experiment import DEFAULT_CONFIG
@@ -191,6 +191,20 @@ def functional_forward(model, fast_params, X, sid):
 def compose_dw(A, B):
     """(alpha/r) omitted deliberately: cancels in the requested relative losses."""
     return torch.einsum('oj,jikl->oikl', B.squeeze(-1).squeeze(-1), A)
+
+
+def average_adapters_over(model, slot, subjects, layer_names, device):
+    """
+    Average fitted adapters' effective deltas (dW space) over an arbitrary
+    subject-slot list and write the result into `slot`. Unlike
+    inits.init_average(), `subjects` need not be a contiguous range —
+    needed here so B3 can average over pool_subjects (7 of 8 slots,
+    val_subject excluded) rather than all slots.
+    """
+    for name in layer_names:
+        layer = getattr(model, name)
+        Ws = torch.stack([delta_w(layer, s) for s in subjects])
+        load_delta_w_into_slot(layer, Ws.mean(dim=0), slot, device)
 
 
 # ── Generic hypernetwork trainer with early stopping (shared by H1-H4) ────────
@@ -470,11 +484,16 @@ def run_fold(dataset, held_out_1idx, seed, ea, device, quick=False):
     b1_model = copy_frozen_backbone(b1_model, shared_sd, layer_names)
     eval_all('backbone_only', 'none', b1_model, held_out_slot)
 
-    # ── B2: joint shared adapter (pooled, frozen backbone) ──────────────────
-    print('  B2 joint_shared_adapter ...')
+    # Data-matching mask: pool_subjects only (same 7 subjects H1-H4 train on,
+    # val_subject excluded). Used by B2, B3, B4 below.
+    pool_mask = np.isin(train_sids, pool_subjects)
+    pool_X, pool_y, pool_sids = train_X[pool_mask], train_y[pool_mask], train_sids[pool_mask]
+
+    # ── B2: joint shared adapter, data-matched to pool_subjects (7 subjects) ─
+    print('  B2 joint_shared_adapter (data-matched, 7 subjects) ...')
     b2_model = build_baseline_model(n_channels, n_classes, n_times, 1, cfg, device)
     b2_model = copy_frozen_backbone(b2_model, shared_sd, layer_names)
-    fit_adapter_hardlabel(b2_model, train_X, train_y, 0, layer_names, device,
+    fit_adapter_hardlabel(b2_model, pool_X, pool_y, 0, layer_names, device,
                           steps=fit_steps)
     with torch.no_grad():
         for name in layer_names:
@@ -483,26 +502,45 @@ def run_fold(dataset, held_out_1idx, seed, ea, device, quick=False):
             layer.lora_B[1].weight.data.copy_(layer.lora_B[0].weight.data)
     eval_all('joint_shared_adapter', 'none', b2_model, 1)
 
-    # ── B3: average of fitted adapters, dW space ────────────────────────────
-    print('  B3 average_fitted_adapters ...')
+    # ── B2_full: same, but NOT data-matched (all 8 training subjects). ──────
+    # Reference only — excluded from the Holm-corrected comparison family in
+    # analyze_hypernet_objective.py because it sees one extra subject's data
+    # that H1-H4 never train on.
+    print('  B2_full joint_shared_adapter_full (NOT data-matched, 8 subjects) ...')
+    b2f_model = build_baseline_model(n_channels, n_classes, n_times, 1, cfg, device)
+    b2f_model = copy_frozen_backbone(b2f_model, shared_sd, layer_names)
+    fit_adapter_hardlabel(b2f_model, train_X, train_y, 0, layer_names, device,
+                          steps=fit_steps)
+    with torch.no_grad():
+        for name in layer_names:
+            layer = getattr(b2f_model, name)
+            layer.lora_A[1].weight.data.copy_(layer.lora_A[0].weight.data)
+            layer.lora_B[1].weight.data.copy_(layer.lora_B[0].weight.data)
+    eval_all('joint_shared_adapter_full', 'none', b2f_model, 1)
+
+    # ── B3: average of fitted adapters, dW space, data-matched (7 subjects) ─
+    print('  B3 average_fitted_adapters (data-matched, 7 subjects) ...')
     b3_model = build_baseline_model(n_channels, n_classes, n_times, n_train, cfg, device)
     b3_model = copy_frozen_backbone(b3_model, shared_sd, layer_names)
-    for s in range(n_train):
+    for s in pool_subjects:
         Xs = train_X[train_sids == s]
         ys = train_y[train_sids == s]
         fit_adapter_hardlabel(b3_model, Xs, ys, s, layer_names, device, steps=fit_steps)
-    init_average(b3_model, held_out_slot, n_train, layer_names, device)
+    average_adapters_over(b3_model, held_out_slot, pool_subjects, layer_names, device)
     eval_all('average_fitted_adapters', 'none', b3_model, held_out_slot)
 
-    # ── B4: Reptile meta-init zero-shot (frozen shared backbone) ────────────
-    print('  B4 reptile_zero_shot ...')
+    # ── B4: Reptile meta-init zero-shot, data-matched (7 subjects). Reptile
+    # has no early-stopping/model-selection mechanism of its own, so its
+    # training schedule (epochs/K/lr) is left unchanged; only the subject
+    # pool it trains on is restricted to match H1-H4. ─────────────────────────
+    print('  B4 reptile_zero_shot (data-matched, 7 subjects) ...')
     b4_cfg = dict(cfg)
     b4_cfg['freeze_backbone'] = True
     if quick:
         b4_cfg['epochs'] = 5
     b4_model = build_reptile_model(n_channels, n_classes, n_times, n_train, b4_cfg, device)
     b4_model = copy_frozen_backbone(b4_model, shared_sd, layer_names)
-    b4_model, meta_init, _ = train_reptile(b4_model, train_X, train_y, train_sids,
+    b4_model, meta_init, _ = train_reptile(b4_model, pool_X, pool_y, pool_sids,
                                            b4_cfg, device)
     apply_init(b4_model, held_out_slot, 'reptile', meta_init=meta_init, device=device)
     eval_all('reptile_zero_shot', 'none', b4_model, held_out_slot)

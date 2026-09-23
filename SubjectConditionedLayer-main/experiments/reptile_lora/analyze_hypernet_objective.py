@@ -89,6 +89,9 @@ def paired_by_subject(rows, cond_a, ctrl_a, cond_b, ctrl_b, ea, k):
 
 
 def run_comparisons(rows, ea, k):
+    # 'joint_shared_adapter_full' (B2_full, trained on all 8 subjects) is a
+    # reference condition only and is deliberately NOT in this family: it is
+    # not data-matched to H1-H4 (7 subjects, val_subject excluded).
     comparisons = [
         ('recon_product', 'recon_factors'),
         ('end_to_end', 'recon_factors'),
