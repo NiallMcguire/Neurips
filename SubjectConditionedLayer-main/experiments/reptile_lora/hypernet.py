@@ -37,8 +37,16 @@ def subject_context(X_s, eps=1e-6):
     X_s: (N, C, T) numpy array of one subject's trials.
     Returns a 1-D float32 numpy vector:
         [ per-channel log-variance (C,) ,
-          upper-triangle of log-mean-covariance (C*(C+1)/2,) ]
+          log-eigenvalues of the mean trial covariance (C,) ]
     Log-transform keeps the descriptor scale-stable across subjects.
+
+    IMPORTANT: X_s must be PRE-Euclidean-Alignment (raw) trials. EA whitens
+    every subject to a common covariance frame, which collapses this
+    descriptor's across-subject variance to near zero (measured ~1e-4x the
+    raw-data spread on BCI2a fold 1) and makes it uninformative about
+    subject identity. Callers that also apply EA to the data used for
+    model training/evaluation must compute this descriptor from the
+    un-aligned data separately.
     """
     trials = X_s
     N, C, _ = trials.shape
